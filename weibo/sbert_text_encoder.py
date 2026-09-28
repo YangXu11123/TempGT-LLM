@@ -4,6 +4,8 @@ import glob
 import pickle
 import warnings
 from typing import Dict, List, Optional, Any
+import sys
+import types
 import numpy as np
 import torch
 import torch.nn as nn
@@ -266,11 +268,56 @@ class ExperimentalSBERTTextEncoder(nn.Module):
 
 
 def load_subgraph_data(subgraph_file: str) -> Dict:
+    _ensure_torch_geometric_pickle_compat()
     try:
         with open(subgraph_file, 'rb') as f:
             return pickle.load(f)
     except Exception:
         return {}
+
+
+def _ensure_torch_geometric_pickle_compat() -> None:
+    """Allow text-only loading of PyG pickles when torch_geometric is absent."""
+    try:
+        import torch_geometric  # noqa: F401
+        return
+    except ModuleNotFoundError:
+        pass
+
+    if 'torch_geometric.data.data' in sys.modules and 'torch_geometric.data.storage' in sys.modules:
+        return
+
+    class _DummyPyGObject:
+        def __init__(self, *args, **kwargs):
+            self.__dict__.update(kwargs)
+
+        def __setstate__(self, state):
+            if isinstance(state, dict):
+                self.__dict__.update(state)
+            else:
+                self.__dict__['_state'] = state
+
+    tg_mod = types.ModuleType('torch_geometric')
+    data_mod = types.ModuleType('torch_geometric.data')
+    data_data_mod = types.ModuleType('torch_geometric.data.data')
+    storage_mod = types.ModuleType('torch_geometric.data.storage')
+
+    for mod in (tg_mod, data_mod, data_data_mod, storage_mod):
+        sys.modules.setdefault(mod.__name__, mod)
+
+    for cls_name in ('Data', 'DataEdgeAttr', 'DataTensorAttr'):
+        cls = type(cls_name, (_DummyPyGObject,), {'__module__': 'torch_geometric.data.data'})
+        setattr(sys.modules['torch_geometric.data.data'], cls_name, cls)
+        setattr(sys.modules['torch_geometric.data'], cls_name, cls)
+
+    for cls_name in ('BaseStorage', 'GlobalStorage', 'NodeStorage', 'EdgeStorage'):
+        cls = type(cls_name, (_DummyPyGObject,), {'__module__': 'torch_geometric.data.storage'})
+        setattr(sys.modules['torch_geometric.data.storage'], cls_name, cls)
+        setattr(sys.modules['torch_geometric.data'], cls_name, cls)
+
+    sys.modules['torch_geometric'].data = sys.modules['torch_geometric.data']
+    sys.modules['torch_geometric.data'].data = sys.modules['torch_geometric.data.data']
+    sys.modules['torch_geometric.data'].storage = sys.modules['torch_geometric.data.storage']
 
 
 def extract_text_content(item) -> Optional[str]:
@@ -581,9 +628,14 @@ def main():
         'hf_pooling': HF_POOLING,
     }
 
+    input_dir = os.environ.get("SUBGRAPH_INPUT_DIR", "subgraphs")
+    output_dir = os.environ.get("TEXT_OUTPUT_DIR", "sbert_encoded_texts")
+    print(f"输入目录: {input_dir}")
+    print(f"文本 embedding 输出目录: {output_dir}")
+
     stats = batch_encode_node_texts_experimental(
-        input_dir="subgraphs",
-        output_dir="sbert_encoded_texts",
+        input_dir=input_dir,
+        output_dir=output_dir,
         config=config
     )
 

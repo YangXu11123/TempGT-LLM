@@ -1,6 +1,8 @@
 import os
+import argparse
 import json
 import csv
+import hashlib
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -96,16 +98,22 @@ def load_all_data(config: TrainingConfig) -> Tuple[Dict, Dict, Dict, List[str]]:
         ):
             continue
 
+        from_normal6000 = config.normal_gat_encoded_dir in os.path.abspath(gat_file)
+        # 与训练阶段一致：重复账号保留主数据版本，避免被另一套 GAT 表示覆盖。
+        if from_normal6000 and node_id in node_data:
+            continue
+
         node_data[node_id] = {
             "temporal_node_embeddings": temporal_node_embeddings,
             "temporal_text_embeddings": temporal_text_embeddings,
             "timesteps": timesteps_sorted,
+            "source": "normal_6000" if from_normal6000 else "main",
         }
         labels[node_id] = int(label)
         successful_nodes += 1
 
         # 记录来自 normal_6000 目录的节点
-        if config.normal_gat_encoded_dir in os.path.abspath(gat_file):
+        if from_normal6000:
             normal_6000_node_ids.append(node_id)
 
     normal_6000_node_ids = sorted(list(set(normal_6000_node_ids)))
@@ -157,27 +165,8 @@ def compute_scores_for_loader(
                 labels=None,
             )
 
-            logits = outputs["logits"]
-            batch_size, seq_len, _ = logits.shape
-
-            last_pos = torch.full((batch_size,), seq_len - 1, device=device, dtype=torch.long)
-            batch_idx = torch.arange(batch_size, device=device, dtype=torch.long)
-            last_token_logits = logits[batch_idx, last_pos, :]
-
-            benign_token = model.llm_tokenizer(
-                "0", return_tensors="pt", add_special_tokens=False
-            )["input_ids"][0][-1].item()
-            malicious_token = model.llm_tokenizer(
-                "1", return_tensors="pt", add_special_tokens=False
-            )["input_ids"][0][-1].item()
-
-            pair_logits = torch.stack(
-                [
-                    last_token_logits[:, benign_token],
-                    last_token_logits[:, malicious_token],
-                ],
-                dim=-1,
-            )
+            # forward 已按每个样本的最后一个有效位置提取 {'0','1'} logits。
+            pair_logits = outputs["logits_2"]
             pair_prob = F.softmax(pair_logits, dim=-1)
             p_malicious = pair_prob[:, 1]
 
@@ -216,6 +205,148 @@ def compute_scores_for_loader(
             all_cee.extend(batch_cee)
 
     return np.array(all_s_gen), np.array(all_labels), all_node_ids, np.array(all_cee)
+
+
+def file_sha256(path: str) -> str:
+    if not path or not os.path.exists(path):
+        return ""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def summarize_cee_groups(cee_scores: np.ndarray, labels: np.ndarray, config: TrainingConfig) -> Dict:
+    """冻结 CEE head 的组间打分（修改方向.md 一.5）：normal vs malicious 的分布统计
+    + Mann-Whitney U 双侧检验（p 值、效应量 r）。"""
+    cee_scores = np.asarray(cee_scores, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.int32)
+    out = {
+        "score_definition": "mean conditional log likelihood; higher means more predictable",
+        "cee_head_path": os.path.abspath(getattr(config, "cee_head_path", "")),
+        "cee_head_sha256": file_sha256(os.path.abspath(getattr(config, "cee_head_path", ""))),
+        "groups": {},
+    }
+
+    for name, value in [("normal", 0), ("malicious", 1)]:
+        arr = cee_scores[labels == value]
+        if arr.size == 0:
+            out["groups"][name] = {"n": 0}
+            continue
+        out["groups"][name] = {
+            "n": int(arr.size),
+            "mean": float(np.mean(arr)),
+            "median": float(np.median(arr)),
+            "std": float(np.std(arr)),
+            "q1": float(np.quantile(arr, 0.25)),
+            "q3": float(np.quantile(arr, 0.75)),
+        }
+
+    normal = cee_scores[labels == 0]
+    malicious = cee_scores[labels == 1]
+    if normal.size > 0 and malicious.size > 0:
+        try:
+            from scipy.stats import mannwhitneyu
+
+            u_stat, p_value = mannwhitneyu(malicious, normal, alternative="two-sided")
+            n_total = malicious.size + normal.size
+            _, ties = np.unique(np.concatenate([malicious, normal]), return_counts=True)
+            variance = malicious.size*normal.size/12.0 * (n_total+1 - float(np.sum(ties**3-ties))/(n_total*(n_total-1)))
+            z_approx = (float(u_stat)-malicious.size*normal.size/2.0)/np.sqrt(variance) if variance > 0 else 0.0
+            out["mann_whitney_u"] = {
+                "u_statistic": float(u_stat),
+                "p_value": float(p_value),
+                "effect_size_r_approx": float(abs(z_approx) / np.sqrt(n_total)),
+            }
+        except Exception as exc:
+            out["mann_whitney_u"] = {"error": str(exc)}
+    return out
+
+
+def save_abc_cee_analysis(
+    s_gen: np.ndarray,
+    cee_scores: np.ndarray,
+    labels: np.ndarray,
+    node_ids: List[str],
+    output_dir: str,
+    config: TrainingConfig,
+) -> str:
+    """构造关闭 L_CEE 模型的 Group A/B/C，并保存 CDF 与统计检验。"""
+    import matplotlib.pyplot as plt
+    from scipy.stats import mannwhitneyu
+
+    s_gen = np.asarray(s_gen, dtype=np.float64)
+    cee_scores = np.asarray(cee_scores, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.int32)
+    n = len(node_ids)
+    if not (s_gen.size == cee_scores.size == labels.size == n):
+        raise ValueError("ABC arrays and node_ids are not aligned")
+
+    k = min(100, n)
+    order = np.argsort(s_gen, kind="stable")
+    group_indices = {
+        "A_ground_truth_CIB": np.flatnonzero(labels == 1),
+        "B_top_100_CIB_score": order[-k:][::-1],
+        "C_bottom_100_benign_oriented": order[:k],
+    }
+
+    result = {
+        "score_definition": "mean conditional log likelihood; higher means more predictable",
+        "definition": {
+            "A": "all ground-truth CIB accounts in the test set",
+            "B": f"top-{k} test accounts by CIB classification score from lambda_CEE=0 model",
+            "C": f"bottom-{k} test accounts by CIB classification score from the same lambda_CEE=0 model",
+        },
+        "cee_head_path": os.path.abspath(config.cee_head_path),
+        "cee_head_sha256": file_sha256(os.path.abspath(config.cee_head_path)),
+        "groups": {},
+        "pairwise_mann_whitney_u": {},
+    }
+
+    group_values = {}
+    for name, idx in group_indices.items():
+        values = cee_scores[idx]
+        group_values[name] = values
+        result["groups"][name] = {
+            "n": int(values.size),
+            "node_ids": [str(node_ids[i]) for i in idx],
+            "classification_scores": s_gen[idx].tolist(),
+            "cee_scores": values.tolist(),
+            "mean": float(np.mean(values)) if values.size else None,
+            "median": float(np.median(values)) if values.size else None,
+            "std": float(np.std(values)) if values.size else None,
+        }
+
+    pairs = [
+        ("A_ground_truth_CIB", "B_top_100_CIB_score"),
+        ("A_ground_truth_CIB", "C_bottom_100_benign_oriented"),
+        ("B_top_100_CIB_score", "C_bottom_100_benign_oriented"),
+    ]
+    from abc_statistics import compare_groups, display_label, X_LABEL, Y_LABEL
+    for left, right in pairs:
+        a, b = group_values[left], group_values[right]
+        result['pairwise_mann_whitney_u'][f'{left}_vs_{right}'] = compare_groups(
+            a, b, result['groups'][left]['node_ids'], result['groups'][right]['node_ids'])
+
+    os.makedirs(output_dir, exist_ok=True)
+    json_path = os.path.join(output_dir, "cee_groups_abc.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+
+    plt.figure(figsize=(7, 5))
+    for name, values in group_values.items():
+        sorted_values = np.sort(values)
+        cumulative = np.arange(1, values.size + 1) / values.size
+        plt.step(sorted_values, cumulative, where="post", label=display_label(name))
+    plt.xlabel(X_LABEL)
+    plt.ylabel(Y_LABEL)
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "cee_groups_abc_cdf.png"), dpi=300)
+    plt.close()
+    return json_path
 
 
 # 单阈值分类 + 指标计算
@@ -429,19 +560,30 @@ def main():
     ratio_list = [10, 20, 30, 40, 50]
     seed_list = [42, 43, 44, 45, 46]
 
-    config = TrainingConfig()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default=None)
+    parser.add_argument("--lambda-cee", type=float, default=None)
+    parser.add_argument("--output-dir", type=str, default=None)
+    args = parser.parse_args()
+
+    from config import load_config
+    config = load_config(args.config)
+    ratio_list = list(config.evaluation_ratios)
+    seed_list = list(config.evaluation_seeds)
+    if args.lambda_cee is not None:
+        config.lambda_cee = float(args.lambda_cee)
+    if args.output_dir:
+        config.output_dir = os.path.abspath(args.output_dir)
     os.makedirs(config.output_dir, exist_ok=True)
     print(f"使用设备: {config.device}")
 
     node_data, labels, graph_data, normal_6000_node_ids = load_all_data(config)
     if len(node_data) == 0 or len(labels) == 0:
-        print("没有有效数据，退出")
-        return
+        raise RuntimeError('No valid inference data.')
 
     split_path = os.path.join(config.output_dir, "dataset_split.json")
     if not os.path.exists(split_path):
-        print(f"未找到训练阶段保存的划分文件: {split_path}")
-        return
+        raise FileNotFoundError(f'Missing fixed dataset split: {split_path}')
 
     with open(split_path, "r", encoding="utf-8") as f:
         split_info = json.load(f)
@@ -451,6 +593,8 @@ def main():
 
     # 测试集中的已加载节点
     test_ids_loaded = [nid for nid in test_ids if nid in node_data and nid in labels]
+    if len(test_ids_loaded) != len(test_ids):
+        raise RuntimeError('Fixed test accounts are missing; refusing evaluation on a silently reduced test set.')
 
     # 恶意固定集合（来自测试集）
     test_malicious_ids = [nid for nid in test_ids_loaded if int(labels[nid]) == 1]
@@ -468,8 +612,7 @@ def main():
     print("说明：后续正常用户仅从该采样池抽取，避免Val/Test泄露。")
 
     if len(test_malicious_ids) == 0:
-        print("测试集中没有恶意用户，无法进行比例评估，退出")
-        return
+        raise RuntimeError('No CIB users in the fixed test set; ratio evaluation cannot run.')
 
     # 加载模型与阈值（与原脚本衔接）
     fold_idx = 1
@@ -480,28 +623,22 @@ def main():
     fold_summary_path = os.path.join(fold_output_dir, "fold_summary.json")
 
     if not os.path.exists(best_model_path):
-        print(f"未找到最佳模型: {best_model_path}，请确认训练是否成功完成")
-        return
+        raise FileNotFoundError(f'Missing best model: {best_model_path}')
     if not os.path.exists(fold_summary_path):
-        print(f"未找到 fold_summary.json: {fold_summary_path}，无法获取最佳阈值")
-        return
+        raise FileNotFoundError(f'Missing validation threshold summary: {fold_summary_path}')
 
     with open(fold_summary_path, "r", encoding="utf-8") as f:
         fold_summary = json.load(f)
 
     if "best_thresholds" not in fold_summary or "theta" not in fold_summary["best_thresholds"]:
-        print("fold_summary.json 中没有 best_thresholds.theta，无法进行判定")
-        return
+        raise RuntimeError('fold_summary.json has no best_thresholds.theta.')
 
     theta = float(fold_summary["best_thresholds"]["theta"])
     print(f"\n使用阈值: θ={theta:.4f}")
 
     print("\n加载分词器...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        config.llm_model_path,
-        trust_remote_code=True,
-        padding_side="left",
-    )
+    from backbone_adapter import load_backbone_tokenizer
+    tokenizer = load_backbone_tokenizer(config.llm_model_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -517,6 +654,60 @@ def main():
 
     ratio_eval_root = os.path.join(fold_output_dir, "ratio_seed_eval")
     os.makedirs(ratio_eval_root, exist_ok=True)
+
+    # 全测试集冻结 CEE 打分（修改方向.md 一.5：报告组间 Mann-Whitney U 的 p 值与效应量 r）
+    print("\n开始全测试集冻结 CEE head 打分...")
+    full_test_dataset = TemporalGraphTextDataset(
+        node_data={nid: node_data[nid] for nid in test_ids_loaded},
+        labels={nid: labels[nid] for nid in test_ids_loaded},
+        max_seq_len=config.max_sequence_length,
+        is_training=False,
+        struct_node_dim=struct_node_dim,
+        text_dim=text_dim,
+    )
+    full_test_loader = DataLoader(
+        full_test_dataset,
+        batch_size=config.batch_size,
+        shuffle=False,
+        collate_fn=collate_fn,
+        num_workers=2,
+        pin_memory=True,
+    )
+
+    s_gen_full, y_full, ids_full, cee_full = compute_scores_for_loader(model, full_test_loader, config)
+    cee_full_summary = summarize_cee_groups(cee_full, y_full, config)
+
+    print("[CEE] 全测试集组间统计:")
+    for g_name, g_stats in cee_full_summary["groups"].items():
+        print(f"  {g_name}: {g_stats}")
+    if "mann_whitney_u" in cee_full_summary:
+        print(f"  Mann-Whitney U: {cee_full_summary['mann_whitney_u']}")
+
+    cee_full_path = os.path.join(fold_output_dir, "cee_full_test_summary.json")
+    with open(cee_full_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "node_ids": ids_full,
+                "y_true": y_full.tolist(),
+                "cee_raw": cee_full.tolist(),
+                **cee_full_summary,
+            },
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+    print(f"[CEE] 全测试集 CEE 摘要已保存: {cee_full_path}")
+
+    if float(config.lambda_cee) == 0.0:
+        abc_path = save_abc_cee_analysis(
+            s_gen=s_gen_full,
+            cee_scores=cee_full,
+            labels=y_full,
+            node_ids=ids_full,
+            output_dir=fold_output_dir,
+            config=config,
+        )
+        print(f"[CEE] Group A/B/C 分析已保存: {abc_path}")
 
     all_run_records: List[Dict] = []
     by_ratio_records: Dict[int, List[Dict]] = {r: [] for r in ratio_list}
@@ -578,6 +769,7 @@ def main():
 
             metrics = apply_dual_threshold(s_gen_all, y_all, theta)
             recall_at_k = compute_recall_at_k_with_counts(s_gen_all, y_all, k_list=[10, 30, 50])
+            cee_summary = summarize_cee_groups(cee_all, y_all, config)
 
             print(
                 f"[比例1:{ratio} | seed={seed}] "
@@ -624,6 +816,7 @@ def main():
                 "y_true": y_all.tolist(),
                 "y_pred": metrics["y_pred"],
                 "cee_raw": cee_all.tolist(),
+                "cee_summary": cee_summary,
             }
 
             inference_path = os.path.join(run_dir, "inference_test_users.json")
@@ -692,6 +885,8 @@ def main():
         "theta": theta,
         "ratio_list": ratio_list,
         "seed_list": seed_list,
+        "cee_full_test_summary_path": cee_full_path,
+        "config": {k: str(v) if isinstance(v, torch.device) else v for k, v in config.__dict__.items()},
         "sampling_policy": {
             "malicious_source": "test_ids 中 label==1 的全部用户",
             "normal_source": "test_ids ∩ normal_6000_node_ids ∩ label==0",
@@ -741,4 +936,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

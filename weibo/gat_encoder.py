@@ -3,6 +3,8 @@ import re
 import glob
 import random
 import pickle
+import concurrent.futures
+import multiprocessing as mp
 import warnings
 from typing import Dict, List, Tuple, Optional
 
@@ -287,6 +289,22 @@ class ExperimentalTemporalGATEncoder(nn.Module):
             return edge_index
         return torch.stack([edge_index[1], edge_index[0]], dim=0)
 
+    @staticmethod
+    def drop_edge(edge_index: torch.Tensor, edge_dropout_p: float = 0.0) -> torch.Tensor:
+        if edge_index is None or edge_index.numel() == 0 or edge_index.size(1) == 0:
+            return edge_index
+        p = float(edge_dropout_p)
+        if p <= 0.0:
+            return edge_index
+        if p >= 1.0:
+            p = 0.999
+
+        num_edges = edge_index.size(1)
+        keep = torch.rand(num_edges, device=edge_index.device) >= p
+        if not bool(keep.any()):
+            keep[torch.randint(0, num_edges, (1,), device=edge_index.device)] = True
+        return edge_index[:, keep]
+
     def apply_gnn(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         num_nodes = x.size(0)
         if edge_index is None or edge_index.numel() == 0:
@@ -296,7 +314,8 @@ class ExperimentalTemporalGATEncoder(nn.Module):
 
     def encode_subgraph_with_experimental_design(self,
                                                  subgraph_data: Data,
-                                                 is_out_subgraph: bool = False) -> torch.Tensor:
+                                                 is_out_subgraph: bool = False,
+                                                 edge_dropout_p: float = 0.0) -> torch.Tensor:
         if subgraph_data is None or subgraph_data.num_nodes == 0:
             return torch.zeros((0, self.hidden_dim), device=self.device)
 
@@ -309,11 +328,13 @@ class ExperimentalTemporalGATEncoder(nn.Module):
                 edge_index = self.reverse_edges_for_out_subgraph(subgraph_data.edge_index)
             else:
                 edge_index = subgraph_data.edge_index
+            edge_index = self.drop_edge(edge_index, edge_dropout_p=edge_dropout_p)
 
             return self.apply_gnn(node_features, edge_index)
 
     def encode_temporal_subgraphs(self,
-                                 temporal_subgraphs: Dict[int, Tuple[Optional[Data], Optional[Data]]]
+                                 temporal_subgraphs: Dict[int, Tuple[Optional[Data], Optional[Data]]],
+                                 edge_dropout_p: float = 0.0,
                                  ) -> Dict[int, Dict[str, torch.Tensor]]:
         self.eval()
         time_steps = sorted(temporal_subgraphs.keys())
@@ -322,8 +343,8 @@ class ExperimentalTemporalGATEncoder(nn.Module):
         with torch.no_grad():
             for t in time_steps:
                 out_sg, in_sg = temporal_subgraphs[t]
-                out_repr = self.encode_subgraph_with_experimental_design(out_sg, is_out_subgraph=True)
-                in_repr = self.encode_subgraph_with_experimental_design(in_sg, is_out_subgraph=False)
+                out_repr = self.encode_subgraph_with_experimental_design(out_sg, is_out_subgraph=True, edge_dropout_p=edge_dropout_p)
+                in_repr = self.encode_subgraph_with_experimental_design(in_sg, is_out_subgraph=False, edge_dropout_p=edge_dropout_p)
 
                 temporal_node_embeddings[t] = {
                     'out_node_embeddings': out_repr.cpu(),
@@ -366,6 +387,81 @@ def load_subgraph_data(subgraph_file: str) -> Dict:
         return {}
 
 
+def _encode_chunk_worker(payload) -> Dict:
+    """Encode an independent file chunk in a forked CPU worker."""
+    (
+        subgraph_files,
+        encoder_config,
+        checkpoint_path,
+        output_dir,
+        edge_drop_output_dir,
+        edge_dropout_p,
+        edge_dropout_seed,
+        worker_id,
+    ) = payload
+
+    worker_config = dict(encoder_config)
+    worker_config['device'] = torch.device('cpu')
+    encoder = ExperimentalTemporalGATEncoder(**worker_config)
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    state_dict = checkpoint.get('encoder_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
+    encoder.load_state_dict(state_dict, strict=False)
+    encoder.freeze_gnn_parameters()
+
+    seed = int(edge_dropout_seed) + int(worker_id)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    stats = {
+        'successful': 0,
+        'failed': 0,
+        'failed_files': [],
+        'output_files': [],
+        'total_size_mb': 0.0,
+        'edge_drop_successful': 0,
+        'edge_drop_failed': 0,
+        'edge_drop_output_files': [],
+    }
+
+    for subgraph_file in subgraph_files:
+        try:
+            node_id = extract_node_id_from_filename(subgraph_file)
+            subgraph_data = load_subgraph_data(subgraph_file)
+            if not subgraph_data:
+                raise RuntimeError('empty subgraph payload')
+
+            result = process_subgraph_data_with_pretrained_gat(subgraph_data, encoder, edge_dropout_p=0.0)
+            if not result:
+                raise RuntimeError('empty encoder result')
+
+            output_filename = f"subgraph_{node_id}_k2_gat_encoded.pkl"
+            output_path = os.path.join(output_dir, output_filename)
+            with open(output_path, 'wb') as f:
+                pickle.dump(result, f)
+            stats['successful'] += 1
+            stats['output_files'].append(output_path)
+            stats['total_size_mb'] += os.path.getsize(output_path) / 1024 / 1024
+
+            if edge_drop_output_dir and float(edge_dropout_p) > 0.0:
+                edge_result = process_subgraph_data_with_pretrained_gat(
+                    subgraph_data, encoder, edge_dropout_p=float(edge_dropout_p)
+                )
+                if edge_result:
+                    edge_output_path = os.path.join(edge_drop_output_dir, output_filename)
+                    with open(edge_output_path, 'wb') as f:
+                        pickle.dump(edge_result, f)
+                    stats['edge_drop_successful'] += 1
+                    stats['edge_drop_output_files'].append(edge_output_path)
+                else:
+                    stats['edge_drop_failed'] += 1
+        except Exception:
+            stats['failed'] += 1
+            stats['failed_files'].append(subgraph_file)
+
+    return stats
+
+
 def pretrain_gat_with_link_prediction(subgraph_files: List[str],
                                       encoder: ExperimentalTemporalGATEncoder,
                                       num_epochs: int = 10,
@@ -381,7 +477,10 @@ def pretrain_gat_with_link_prediction(subgraph_files: List[str],
     criterion = torch.nn.BCELoss()
 
     valid_subgraphs = []
+    sample_limit = int(max_samples) if max_samples is not None and int(max_samples) > 0 else None
     for subgraph_file in subgraph_files:
+        if sample_limit is not None and len(valid_subgraphs) >= sample_limit:
+            break
         try:
             subgraph_data = load_subgraph_data(subgraph_file)
             if (not subgraph_data) or ('temporal_subgraphs' not in subgraph_data):
@@ -390,15 +489,25 @@ def pretrain_gat_with_link_prediction(subgraph_files: List[str],
             temporal_subgraphs = subgraph_data['temporal_subgraphs']
             for _, (out_sg, in_sg) in temporal_subgraphs.items():
                 for sg in (out_sg, in_sg):
+                    if sample_limit is not None and len(valid_subgraphs) >= sample_limit:
+                        break
                     if sg is None:
                         continue
                     if (hasattr(sg, 'edge_index') and sg.edge_index.numel() > 0 and getattr(sg, 'num_nodes', 0) > 1):
                         valid_subgraphs.append(sg)
+                if sample_limit is not None and len(valid_subgraphs) >= sample_limit:
+                    break
         except Exception:
             continue
 
     if not valid_subgraphs:
         return float('inf')
+
+    # The caller intentionally bounds pretraining to a deterministic subset.
+    # Without this slice, the max_samples argument is silently ignored and
+    # every temporal graph is revisited for every pretraining epoch.
+    if max_samples is not None and int(max_samples) > 0:
+        valid_subgraphs = valid_subgraphs[:int(max_samples)]
 
     print(
         f"开始预训练 GNN：type={encoder.graph_encoder_type}, layers={encoder.gnn_layers}, "
@@ -471,7 +580,8 @@ def pretrain_gat_with_link_prediction(subgraph_files: List[str],
 
 
 def process_subgraph_data_with_pretrained_gat(subgraph_data: Dict,
-                                             encoder: ExperimentalTemporalGATEncoder) -> Dict:
+                                             encoder: ExperimentalTemporalGATEncoder,
+                                             edge_dropout_p: float = 0.0) -> Dict:
     if 'temporal_subgraphs' not in subgraph_data:
         return {}
 
@@ -502,6 +612,7 @@ def process_subgraph_data_with_pretrained_gat(subgraph_data: Dict,
                 'gat_num_heads': encoder.num_heads,
                 'sage_aggr': encoder.sage_aggr,
                 'pretrained': True,
+                'edge_dropout_p': float(edge_dropout_p),
                 'out_in_concat': False,
                 'graph_level_pooling_in_this_file': False
             }
@@ -511,7 +622,10 @@ def process_subgraph_data_with_pretrained_gat(subgraph_data: Dict,
         if not encoder.gnn_frozen:
             encoder.freeze_gnn_parameters()
 
-        temporal_node_embeddings = encoder.encode_temporal_subgraphs(temporal_subgraphs)
+        temporal_node_embeddings = encoder.encode_temporal_subgraphs(
+            temporal_subgraphs,
+            edge_dropout_p=edge_dropout_p,
+        )
 
         return {
             'center_node': center_node,
@@ -527,6 +641,7 @@ def process_subgraph_data_with_pretrained_gat(subgraph_data: Dict,
                 'gat_num_heads': encoder.num_heads,
                 'sage_aggr': encoder.sage_aggr,
                 'pretrained': True,
+                'edge_dropout_p': float(edge_dropout_p),
                 'out_in_concat': False,
                 'graph_level_pooling_in_this_file': False,
                 'experimental_design': True,
@@ -562,6 +677,11 @@ def extract_node_id_from_filename(filename: str) -> str:
 
 def batch_encode_subgraphs_experimental(input_dir: str = "subgraphs",
                                        output_dir: str = "gat_encoded_subgraphs",
+                                       edge_drop_output_dir: Optional[str] = None,
+                                       edge_dropout_p: float = 0.0,
+                                       edge_dropout_seed: int = 20260911,
+                                       encoder_checkpoint_path: Optional[str] = None,
+                                       load_encoder_checkpoint: bool = False,
                                        config: Dict = None) -> Dict:
     if config is None:
         config = {
@@ -576,6 +696,8 @@ def batch_encode_subgraphs_experimental(input_dir: str = "subgraphs",
         }
 
     os.makedirs(output_dir, exist_ok=True)
+    if edge_drop_output_dir:
+        os.makedirs(edge_drop_output_dir, exist_ok=True)
 
     subgraph_files = find_subgraph_files(input_dir)
     if not subgraph_files:
@@ -583,12 +705,35 @@ def batch_encode_subgraphs_experimental(input_dir: str = "subgraphs",
 
     encoder = ExperimentalTemporalGATEncoder(**config)
 
-    pretrain_loss = pretrain_gat_with_link_prediction(
-        subgraph_files, encoder,
-        num_epochs=20, lr=0.001, max_samples=100
-    )
+    if encoder_checkpoint_path is None:
+        encoder_checkpoint_path = os.path.join(output_dir, "gnn_encoder.pt")
+
+    pretrain_loss = None
+    if load_encoder_checkpoint:
+        if not os.path.exists(encoder_checkpoint_path):
+            raise FileNotFoundError(f"GNN encoder checkpoint not found: {encoder_checkpoint_path}")
+        checkpoint = torch.load(encoder_checkpoint_path, map_location=encoder.device, weights_only=False)
+        state_dict = checkpoint.get('encoder_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
+        encoder.load_state_dict(state_dict, strict=False)
+        print(f"加载已预训练 GNN encoder: {encoder_checkpoint_path}")
+    else:
+        pretrain_loss = pretrain_gat_with_link_prediction(
+            subgraph_files, encoder,
+            num_epochs=20, lr=0.001, max_samples=100
+        )
+        torch.save({
+            'encoder_state_dict': encoder.state_dict(),
+            'config': config,
+            'pretrain_loss': pretrain_loss,
+        }, encoder_checkpoint_path)
+        print(f"保存 GNN encoder checkpoint: {encoder_checkpoint_path}")
 
     encoder.freeze_gnn_parameters()
+    random.seed(int(edge_dropout_seed))
+    np.random.seed(int(edge_dropout_seed))
+    torch.manual_seed(int(edge_dropout_seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(edge_dropout_seed))
 
     stats = {
         'total_files': len(subgraph_files),
@@ -598,42 +743,112 @@ def batch_encode_subgraphs_experimental(input_dir: str = "subgraphs",
         'output_files': [],
         'total_size_mb': 0.0,
         'pretrain_loss': pretrain_loss,
+        'encoder_checkpoint_path': encoder_checkpoint_path,
+        'edge_drop_output_dir': edge_drop_output_dir,
+        'edge_dropout_p': float(edge_dropout_p),
+        'edge_dropout_seed': int(edge_dropout_seed),
+        'edge_drop_successful': 0,
+        'edge_drop_failed': 0,
+        'edge_drop_output_files': [],
         'graph_encoder_type': encoder.graph_encoder_type,
         'gnn_layers': encoder.gnn_layers,
         'num_heads': encoder.num_heads,
         'sage_aggr': encoder.sage_aggr
     }
 
-    for subgraph_file in tqdm(subgraph_files, desc="批量编码"):
+    def _encode_one(subgraph_file: str) -> Dict:
+        result_stats = {
+            'successful': 0,
+            'failed': 0,
+            'failed_files': [],
+            'output_files': [],
+            'total_size_mb': 0.0,
+            'edge_drop_successful': 0,
+            'edge_drop_failed': 0,
+            'edge_drop_output_files': [],
+        }
         try:
             node_id = extract_node_id_from_filename(subgraph_file)
-
             subgraph_data = load_subgraph_data(subgraph_file)
             if not subgraph_data:
-                stats['failed'] += 1
-                stats['failed_files'].append(subgraph_file)
-                continue
+                raise RuntimeError("empty subgraph payload")
 
-            result = process_subgraph_data_with_pretrained_gat(subgraph_data, encoder)
+            result = process_subgraph_data_with_pretrained_gat(
+                subgraph_data, encoder, edge_dropout_p=0.0
+            )
             if not result:
-                stats['failed'] += 1
-                stats['failed_files'].append(subgraph_file)
-                continue
+                raise RuntimeError("empty encoder result")
 
             output_filename = f"subgraph_{node_id}_k2_gat_encoded.pkl"
             output_path = os.path.join(output_dir, output_filename)
-
             with open(output_path, 'wb') as f:
                 pickle.dump(result, f)
 
-            stats['successful'] += 1
-            stats['output_files'].append(output_path)
-            stats['total_size_mb'] += os.path.getsize(output_path) / 1024 / 1024
+            result_stats['successful'] = 1
+            result_stats['output_files'].append(output_path)
+            result_stats['total_size_mb'] = os.path.getsize(output_path) / 1024 / 1024
 
+            if edge_drop_output_dir and float(edge_dropout_p) > 0.0:
+                edge_result = process_subgraph_data_with_pretrained_gat(
+                    subgraph_data, encoder, edge_dropout_p=float(edge_dropout_p)
+                )
+                if edge_result:
+                    edge_output_path = os.path.join(edge_drop_output_dir, output_filename)
+                    with open(edge_output_path, 'wb') as f:
+                        pickle.dump(edge_result, f)
+                    result_stats['edge_drop_successful'] = 1
+                    result_stats['edge_drop_output_files'].append(edge_output_path)
+                else:
+                    result_stats['edge_drop_failed'] = 1
         except Exception:
-            stats['failed'] += 1
-            stats['failed_files'].append(subgraph_file)
-            continue
+            result_stats['failed'] = 1
+            result_stats['failed_files'].append(subgraph_file)
+        return result_stats
+
+    num_workers = max(1, int(os.environ.get("GAT_ENCODE_WORKERS", "1")))
+    if num_workers > 1:
+        torch.set_num_threads(1)
+        chunks = [subgraph_files[i::num_workers] for i in range(num_workers)]
+        payloads = [
+            (
+                chunk,
+                config,
+                encoder_checkpoint_path,
+                output_dir,
+                edge_drop_output_dir,
+                float(edge_dropout_p),
+                int(edge_dropout_seed),
+                worker_id,
+            )
+            for worker_id, chunk in enumerate(chunks)
+            if chunk
+        ]
+        ctx = mp.get_context("fork")
+        with ctx.Pool(processes=len(payloads)) as pool:
+            for item in tqdm(
+                pool.imap_unordered(_encode_chunk_worker, payloads),
+                total=len(payloads),
+                desc=f"批量编码({len(payloads)}进程)",
+            ):
+                stats['successful'] += item['successful']
+                stats['failed'] += item['failed']
+                stats['failed_files'].extend(item['failed_files'])
+                stats['output_files'].extend(item['output_files'])
+                stats['total_size_mb'] += item['total_size_mb']
+                stats['edge_drop_successful'] += item['edge_drop_successful']
+                stats['edge_drop_failed'] += item['edge_drop_failed']
+                stats['edge_drop_output_files'].extend(item['edge_drop_output_files'])
+    else:
+        for subgraph_file in tqdm(subgraph_files, desc="批量编码"):
+            item = _encode_one(subgraph_file)
+            stats['successful'] += item['successful']
+            stats['failed'] += item['failed']
+            stats['failed_files'].extend(item['failed_files'])
+            stats['output_files'].extend(item['output_files'])
+            stats['total_size_mb'] += item['total_size_mb']
+            stats['edge_drop_successful'] += item['edge_drop_successful']
+            stats['edge_drop_failed'] += item['edge_drop_failed']
+            stats['edge_drop_output_files'].extend(item['edge_drop_output_files'])
 
     stats_file = os.path.join(output_dir, "experimental_gnn_encoding_stats.pkl")
     with open(stats_file, 'wb') as f:
@@ -661,10 +876,29 @@ def main():
         'sage_aggr': 'mean',
     }
 
+    input_dir = os.environ.get("SUBGRAPH_INPUT_DIR", "subgraphs")
+    output_dir = os.environ.get("GAT_OUTPUT_DIR", "gat_encoded_subgraphs")
+    edge_drop_output_dir = os.environ.get("EDGE_DROP_GAT_OUTPUT_DIR", "gat_encoded_subgraphs_edge_drop")
+    edge_dropout_p = float(os.environ.get("EDGE_DROPOUT_P", "0.2"))
+    edge_dropout_seed = int(os.environ.get("EDGE_DROPOUT_SEED", "20260911"))
+    encoder_checkpoint_path = os.environ.get("GAT_ENCODER_CHECKPOINT", os.path.join(output_dir, "gnn_encoder.pt"))
+    load_encoder_checkpoint = os.environ.get("GAT_LOAD_CHECKPOINT", "0") == "1"
+
+    print(f"输入目录: {input_dir}")
+    print(f"原始 GAT 输出目录: {output_dir}")
+    print(f"edge-drop GAT 输出目录: {edge_drop_output_dir}")
+    print(f"edge_dropout_p: {edge_dropout_p}")
+    print(f"GNN checkpoint: {encoder_checkpoint_path}, load={load_encoder_checkpoint}")
+
     stats = batch_encode_subgraphs_experimental(
-        input_dir="subgraphs",
-        output_dir="gat_encoded_subgraphs",
-        config=config
+        input_dir=input_dir,
+        output_dir=output_dir,
+        edge_drop_output_dir=edge_drop_output_dir,
+        edge_dropout_p=edge_dropout_p,
+        edge_dropout_seed=edge_dropout_seed,
+        encoder_checkpoint_path=encoder_checkpoint_path,
+        load_encoder_checkpoint=load_encoder_checkpoint,
+        config=config,
     )
 
     if not stats:
@@ -675,7 +909,11 @@ def main():
     print(f"总文件数: {stats['total_files']}")
     print(f"成功编码: {stats['successful']}")
     print(f"编码失败: {stats['failed']}")
-    print(f"预训练损失: {stats['pretrain_loss']:.4f}")
+    if stats['pretrain_loss'] is None:
+        print("预训练损失: 复用已有 GNN checkpoint")
+    else:
+        print(f"预训练损失: {stats['pretrain_loss']:.4f}")
+    print(f"edge-drop 成功编码: {stats.get('edge_drop_successful', 0)}")
     print(f"输出大小: {stats['total_size_mb']:.2f} MB")
     print(
         f"type={stats['graph_encoder_type']}, layers={stats['gnn_layers']}, "

@@ -5,12 +5,59 @@ import json
 import os
 import re
 import glob
+import sys
+import types
 from typing import Dict, List, Tuple, Optional, Any
+
+
+def _ensure_torch_geometric_pickle_compat() -> None:
+    """Allow label-only loading of PyG pickles when torch_geometric is absent."""
+    try:
+        import torch_geometric  # noqa: F401
+        return
+    except ModuleNotFoundError:
+        pass
+
+    if 'torch_geometric.data.data' in sys.modules and 'torch_geometric.data.storage' in sys.modules:
+        return
+
+    class _DummyPyGObject:
+        def __init__(self, *args, **kwargs):
+            self.__dict__.update(kwargs)
+
+        def __setstate__(self, state):
+            if isinstance(state, dict):
+                self.__dict__.update(state)
+            else:
+                self.__dict__['_state'] = state
+
+    tg_mod = types.ModuleType('torch_geometric')
+    data_mod = types.ModuleType('torch_geometric.data')
+    data_data_mod = types.ModuleType('torch_geometric.data.data')
+    storage_mod = types.ModuleType('torch_geometric.data.storage')
+
+    for mod in (tg_mod, data_mod, data_data_mod, storage_mod):
+        sys.modules.setdefault(mod.__name__, mod)
+
+    for cls_name in ('Data', 'DataEdgeAttr', 'DataTensorAttr'):
+        cls = type(cls_name, (_DummyPyGObject,), {'__module__': 'torch_geometric.data.data'})
+        setattr(sys.modules['torch_geometric.data.data'], cls_name, cls)
+        setattr(sys.modules['torch_geometric.data'], cls_name, cls)
+
+    for cls_name in ('BaseStorage', 'GlobalStorage', 'NodeStorage', 'EdgeStorage'):
+        cls = type(cls_name, (_DummyPyGObject,), {'__module__': 'torch_geometric.data.storage'})
+        setattr(sys.modules['torch_geometric.data.storage'], cls_name, cls)
+        setattr(sys.modules['torch_geometric.data'], cls_name, cls)
+
+    sys.modules['torch_geometric'].data = sys.modules['torch_geometric.data']
+    sys.modules['torch_geometric.data'].data = sys.modules['torch_geometric.data.data']
+    sys.modules['torch_geometric.data'].storage = sys.modules['torch_geometric.data.storage']
 
 
 def load_original_graph_data(data_path: str) -> Dict:
     """加载原始图数据"""
     try:
+        _ensure_torch_geometric_pickle_compat()
         with open(data_path, 'rb') as f:
             data = pickle.load(f)
         print(f"加载原始图数据成功: {data_path}")
@@ -151,6 +198,40 @@ def load_paired_embeddings(gat_file: str, text_file: str) -> Optional[Dict[str, 
     }
 
 
+def load_gat_embeddings(gat_file: str) -> Optional[Dict[str, Any]]:
+    """加载单独的 GAT 编码文件，用于 edge-drop 结构增强视图。"""
+    try:
+        with open(gat_file, 'rb') as f:
+            gat_data = pickle.load(f)
+    except Exception as e:
+        print(f"加载 GAT 编码文件失败: {gat_file}, 错误: {e}")
+        return None
+
+    node_id = str(gat_data.get('center_node', extract_node_id(gat_file))) if isinstance(gat_data, dict) else extract_node_id(gat_file)
+    temporal_node_embeddings_raw = gat_data.get('temporal_node_embeddings', {}) if isinstance(gat_data, dict) else {}
+    temporal_node_embeddings = _clean_temporal_embeddings_dict(temporal_node_embeddings_raw)
+
+    timestep_set = set(temporal_node_embeddings.keys())
+    if isinstance(gat_data, dict) and 'timesteps' in gat_data:
+        ts = gat_data['timesteps']
+        if isinstance(ts, torch.Tensor):
+            timestep_set.update(int(x) for x in ts.detach().cpu().view(-1).long().tolist())
+        else:
+            try:
+                timestep_set.update(int(x) for x in list(ts))
+            except Exception:
+                pass
+
+    if not temporal_node_embeddings or len(timestep_set) == 0:
+        return None
+
+    return {
+        "node_id": node_id,
+        "temporal_node_embeddings": temporal_node_embeddings,
+        "timesteps": sorted(int(t) for t in timestep_set),
+    }
+
+
 
 def get_user_label(node_id: str, graph_data: Dict) -> Tuple[bool, int]:
     """获取用户标签（恶意=1 正常=0）"""
@@ -274,7 +355,7 @@ def _sample_benign_for_val_test(
         return ben_val, ben_test, info
 
     if not isinstance(val_test_neg_pos_ratio, int) or val_test_neg_pos_ratio <= 0:
-        raise ValueError("val_test_neg_pos_ratio 必须是 None 或正整数，例如 10/20/30/40。")
+        raise ValueError("val_test_neg_pos_ratio 必须是 None 或正整数，例如 10/20/50。")
 
     need_ben_val = n_mal_val * val_test_neg_pos_ratio
     need_ben_test = n_mal_test * val_test_neg_pos_ratio

@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -5,6 +6,8 @@ from transformers import AutoModelForCausalLM
 from peft import LoraConfig, get_peft_model, TaskType
 import numpy as np
 from typing import Dict, Tuple, List, Optional
+
+from cee_dynamics import CEEDynamicsHead, transform_cee_nll_to_score
 
 
 class LearnableAttentionPooling(nn.Module):
@@ -89,37 +92,6 @@ class LearnableAttentionPooling(nn.Module):
 
         return pooled
 
-class CEEHead(nn.Module):
-    """
-    CEE Head: 输入 [s_t; s_{t+1}] ∈ R^{2d}，输出 P(s_{t+1} | s_t) ∈ (0, 1)
-    不经过 LLM，仅接在编码器输出之后。
-    """
-    def __init__(self, input_dim: int):
-        super().__init__()
-        self.input_dim = input_dim
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim * 2, input_dim),
-            nn.ReLU(),
-            nn.Linear(input_dim, 1),
-            nn.Sigmoid(),  # 输出 (0,1)，视为条件概率
-        )
-
-    def forward(self, s_t: torch.Tensor, s_tp1: torch.Tensor) -> torch.Tensor:
-        """
-        s_t, s_tp1: [..., d]
-        返回: [...], 每个位置是 P(s_{t+1} | s_t)
-        """
-        # 保证维度对齐
-        if s_t.dim() == 1:
-            s_t = s_t.unsqueeze(0)
-        if s_tp1.dim() == 1:
-            s_tp1 = s_tp1.unsqueeze(0)
-
-        x = torch.cat([s_t, s_tp1], dim=-1)  # [..., 2d]
-        prob = self.mlp(x).squeeze(-1)      # [...]
-        return prob
-
-
 class UnifiedTemporalGTLLM(nn.Module):
     """统一的时间感知图-文LLM模型"""
 
@@ -151,8 +123,14 @@ class UnifiedTemporalGTLLM(nn.Module):
 
         self.fusion_norm = nn.LayerNorm(2 * config.structure_dim)
 
-        # CEE Head：输入维度 = 结构 256 + 文本投影 256 = 512
-        self.cee_head = CEEHead(input_dim=2 * config.structure_dim)
+        # Frozen CEE dynamics head: mu_theta(x_t) -> x_{t+1}.
+        # It must be pretrained by pretrain_cee_head.py before main training.
+        self.cee_state_dim = 2 * config.structure_dim
+        self.cee_head = CEEDynamicsHead(
+            input_dim=self.cee_state_dim,
+            hidden_dim=getattr(config, "cee_hidden_dim", self.cee_state_dim),
+        )
+        self._load_and_freeze_cee_head()
 
         # 3. 向量到LLM输入的映射层（W_e）
         self.llm_projector = nn.Linear(
@@ -186,31 +164,83 @@ class UnifiedTemporalGTLLM(nn.Module):
         self._count_trainable_params()
         self.llm_dtype = torch.bfloat16
 
-        # ===== 对齐损失相关（结构dropout + memory bank） =====
-        self.struct_timestep_dropout = getattr(self.config, "struct_timestep_dropout", 0.2)
+        # ===== 对齐损失相关（edge-drop view + label-free memory bank） =====
+        self.struct_timestep_dropout = getattr(self.config, "struct_timestep_dropout", 0.0)
         self.align_queue_size = getattr(self.config, "align_queue_size", 512)
         self.align_max_negatives = getattr(self.config, "align_max_negatives", 64)
 
         feat_dim = 2 * self.config.structure_dim  # 512
 
-        self.register_buffer(
-            "queue_benign",
-            torch.zeros(self.align_queue_size, feat_dim, dtype=torch.float32),
-        )
-        self.register_buffer(
-            "queue_cib",
-            torch.zeros(self.align_queue_size, feat_dim, dtype=torch.float32),
-        )
-        self.register_buffer("queue_benign_ptr", torch.zeros(1, dtype=torch.long))
-        self.register_buffer("queue_cib_ptr", torch.zeros(1, dtype=torch.long))
-        self.register_buffer("queue_benign_size", torch.zeros(1, dtype=torch.long))
-        self.register_buffer("queue_cib_size", torch.zeros(1, dtype=torch.long))
+        self.register_buffer("align_queue", torch.zeros(self.align_queue_size, feat_dim, dtype=torch.float32))
+        self.register_buffer("align_queue_ptr", torch.zeros(1, dtype=torch.long))
+        self.register_buffer("align_queue_size_used", torch.zeros(1, dtype=torch.long))
 
         # 前缀缓存
         self._time_prefix_cache = {}
         self._summary_prefix_embedding = None
 
         self.to(config.device)
+
+    def _resolve_path(self, path: str) -> str:
+        if os.path.isabs(path):
+            return path
+        return os.path.abspath(path)
+
+    def _load_and_freeze_cee_head(self) -> None:
+        cee_path = self._resolve_path(getattr(self.config, "cee_head_path", ""))
+        require_pretrained = bool(getattr(self.config, "require_pretrained_cee", True))
+
+        if not cee_path:
+            if require_pretrained:
+                raise FileNotFoundError("config.cee_head_path is empty, but require_pretrained_cee=True")
+            self.cee_head.freeze()
+            return
+
+        if not os.path.exists(cee_path):
+            if require_pretrained:
+                raise FileNotFoundError(
+                    f"Frozen CEE dynamics checkpoint not found: {cee_path}. "
+                    "Run: python pretrain_cee_head.py before python train.py"
+                )
+            print(f"[CEE] 未找到预训练 checkpoint，使用随机冻结 CEE head: {cee_path}")
+            self.cee_head.freeze()
+            return
+
+        checkpoint = torch.load(cee_path, map_location="cpu", weights_only=False)
+        state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+
+        ckpt_input_dim = checkpoint.get("input_dim") if isinstance(checkpoint, dict) else None
+        ckpt_hidden_dim = checkpoint.get("hidden_dim") if isinstance(checkpoint, dict) else None
+        if ckpt_input_dim is not None and int(ckpt_input_dim) != int(self.cee_state_dim):
+            raise ValueError(f"CEE checkpoint input_dim={ckpt_input_dim}, expected {self.cee_state_dim}")
+        if ckpt_hidden_dim is not None and int(ckpt_hidden_dim) != int(getattr(self.config, "cee_hidden_dim", self.cee_state_dim)):
+            raise ValueError(
+                f"CEE checkpoint hidden_dim={ckpt_hidden_dim}, "
+                f"expected {getattr(self.config, 'cee_hidden_dim', self.cee_state_dim)}"
+            )
+
+        self.cee_head.load_state_dict(state_dict, strict=True)
+
+        builder_state = checkpoint.get("state_builder_state_dict") if isinstance(checkpoint, dict) else None
+        if isinstance(builder_state, dict):
+            missing = []
+            if "struct_att_pool" in builder_state:
+                self.struct_att_pool.load_state_dict(builder_state["struct_att_pool"], strict=True)
+            else:
+                missing.append("struct_att_pool")
+            if "text_att_pool" in builder_state:
+                self.text_att_pool.load_state_dict(builder_state["text_att_pool"], strict=True)
+            else:
+                missing.append("text_att_pool")
+            if "text_to_struct_proj" in builder_state:
+                self.text_to_struct_proj.load_state_dict(builder_state["text_to_struct_proj"], strict=True)
+            else:
+                missing.append("text_to_struct_proj")
+            if missing:
+                print(f"[CEE] checkpoint 缺少 state builder 初始权重: {missing}")
+
+        self.cee_head.freeze()
+        print(f"[CEE] 已加载并冻结 CEE dynamics head: {cee_path}")
 
     def set_tokenizer(self, tokenizer):
         self._external_tokenizer = tokenizer
@@ -244,6 +274,7 @@ class UnifiedTemporalGTLLM(nn.Module):
             "text_att_pool": self.text_att_pool,
             "text_to_struct_proj": self.text_to_struct_proj,
             "temporal_position_embedding": self.temporal_position_embedding,
+            "cee_head_frozen": self.cee_head,
             "llm_projector": self.llm_projector,
             "llm_lora": self.llm,
         }
@@ -295,7 +326,7 @@ class UnifiedTemporalGTLLM(nn.Module):
         attention_mask = time_mask.to(device)
         return structure_embeddings, text_embeddings, attention_mask
 
-    # ===================== 节点级全局时序表征 & 结构增强 =====================
+    # ===================== 节点级全局时序表征 & edge-drop 对齐 =====================
 
     def _build_global_sequence_repr(
         self,
@@ -314,117 +345,60 @@ class UnifiedTemporalGTLLM(nn.Module):
         h = fused_masked.sum(dim=1) / lengths            # [B, 512]
         return h
 
-    def _augment_structure_for_alignment(
-        self,
-        structure_embeddings: torch.Tensor,  # [B, T, 256]
-        attention_mask: torch.Tensor,        # [B, T]
-    ) -> torch.Tensor:
-        device = structure_embeddings.device
-        B, T, D = structure_embeddings.shape
-        p_drop = float(self.struct_timestep_dropout)
-
-        if p_drop <= 0.0:
-            return structure_embeddings
-
-        aug = structure_embeddings.clone()
-        time_mask = attention_mask.bool()
-
-        for i in range(B):
-            valid_idx = torch.nonzero(time_mask[i], as_tuple=False).view(-1)
-            L = int(valid_idx.numel())
-            if L <= 1:
-                continue
-
-            drop_count = int(round(p_drop * L))
-            if drop_count <= 0:
-                continue
-            if drop_count >= L:
-                drop_count = L - 1
-
-            perm = torch.randperm(L, device=device)
-            drop_idx = valid_idx[perm[:drop_count]]
-            aug[i, drop_idx, :] = 0.0
-
-        return aug
-
-    def _update_alignment_queues(
-        self,
-        h1: torch.Tensor,     # [B, 512]
-        labels: torch.Tensor  # [B]
-    ) -> None:
+    def _update_alignment_queue(self, h1: torch.Tensor) -> None:
         with torch.no_grad():
-            device = self.queue_benign.device
-            h1 = h1.detach().to(device)
-            labels = labels.to(device)
+            feats = h1.detach().to(self.align_queue.device)
+            if feats.numel() == 0:
+                return
 
-            for cls_value, queue_name, ptr_name, size_name in [
-                (0, "queue_benign", "queue_benign_ptr", "queue_benign_size"),
-                (1, "queue_cib", "queue_cib_ptr", "queue_cib_size"),
-            ]:
-                mask = (labels == cls_value)
-                if not mask.any():
-                    continue
+            K = int(self.align_queue_size)
+            if K <= 0:
+                return
 
-                feats = h1[mask]  # [N_cls, 512]
-                if feats.numel() == 0:
-                    continue
+            num = feats.size(0)
+            if num >= K:
+                feats = feats[-K:]
+                num = K
 
-                K = int(self.align_queue_size)
-                queue = getattr(self, queue_name)
-                ptr_buf = getattr(self, ptr_name)
-                size_buf = getattr(self, size_name)
+            ptr = int(self.align_queue_ptr.item())
+            used = int(self.align_queue_size_used.item())
+            end = ptr + num
 
-                ptr = int(ptr_buf.item())
-                size = int(size_buf.item())
+            if end <= K:
+                self.align_queue[ptr:end] = feats
+            else:
+                first_len = K - ptr
+                self.align_queue[ptr:] = feats[:first_len]
+                self.align_queue[: end - K] = feats[first_len:]
 
-                num = feats.size(0)
-                if num >= K:
-                    feats = feats[-K:]
-                    num = K
+            self.align_queue_ptr[0] = (ptr + num) % K
+            self.align_queue_size_used[0] = min(K, used + num)
 
-                end = ptr + num
-                if end <= K:
-                    queue[ptr:end] = feats
-                else:
-                    first_len = K - ptr
-                    queue[ptr:] = feats[:first_len]
-                    queue[: end - K] = feats[first_len:]
-
-                ptr = (ptr + num) % K
-                size = min(K, size + num)
-
-                ptr_buf[0] = ptr
-                size_buf[0] = size
-
-    # ===================== 对齐损失（Memory Bank版） =====================
+    # ===================== 对齐损失（edge-drop + label-free queue） =====================
 
     def compute_alignment_loss(
         self,
         structure_embeddings: torch.Tensor,  # [B, T, 256]
+        structure_embeddings_aug: Optional[torch.Tensor],  # [B, T, 256]
         text_embeddings: torch.Tensor,       # [B, T, 384]
         attention_mask: torch.Tensor,        # [B, T]
-        labels: Optional[torch.Tensor] = None,
         temperature: float = 0.07,
         epsilon: float = 1e-6,
     ) -> torch.Tensor:
         device = structure_embeddings.device
 
-        # 若完全无标签，保持原逻辑：直接返回 0（这里对齐损失是无监督的，但仍假设训练阶段有 labels 供队列更新）
-        if labels is None:
+        if structure_embeddings_aug is None:
+            if self.training and bool(getattr(self.config, "require_edge_drop_alignment", True)):
+                raise ValueError("L_cont requires edge-drop GAT embeddings, but augmented structure view is missing")
             return torch.tensor(0.0, device=device)
-
-        labels = labels.to(device)
 
         # 1) 计算两种视角的全局表示 h1, h2
         h1 = self._build_global_sequence_repr(
             structure_embeddings, text_embeddings, attention_mask
         )  # [B, 512]
 
-        struct_aug = self._augment_structure_for_alignment(
-            structure_embeddings, attention_mask
-        )
         h2 = self._build_global_sequence_repr(
-            struct_aug, text_embeddings, attention_mask
+            structure_embeddings_aug, text_embeddings, attention_mask
         )  # [B, 512]
 
         # 2) L2 归一化
@@ -433,94 +407,44 @@ class UnifiedTemporalGTLLM(nn.Module):
 
         batch_size = h1_norm.size(0)
 
-        # 3) 构建统一的负样本池（不区分 Benign / CIB）
-        neg_list: List[torch.Tensor] = []
+        logits = torch.matmul(h1_norm, h2_norm.t()) / temperature
+        targets = torch.arange(batch_size, device=device, dtype=torch.long)
 
-        # 3.1 来自 benign 队列的历史样本
-        q_benign_size = int(self.queue_benign_size.item())
-        if q_benign_size > 0:
-            q_benign = self.queue_benign[:q_benign_size]
-            q_benign_norm = F.normalize(q_benign, p=2, dim=-1, eps=epsilon)
-            neg_list.append(q_benign_norm)
+        queue_used = int(self.align_queue_size_used.item())
+        if queue_used > 0:
+            queue = self.align_queue[:queue_used]
+            queue = F.normalize(queue, p=2, dim=-1, eps=epsilon)
+            if queue.size(0) > int(self.align_max_negatives):
+                idx = torch.randperm(queue.size(0), device=device)[: int(self.align_max_negatives)]
+                queue = queue[idx]
+            queue_logits = torch.matmul(h1_norm, queue.t()) / temperature
+            logits = torch.cat([logits, queue_logits], dim=-1)
 
-        # 3.2 来自 cib 队列的历史样本
-        q_cib_size = int(self.queue_cib_size.item())
-        if q_cib_size > 0:
-            q_cib = self.queue_cib[:q_cib_size]
-            q_cib_norm = F.normalize(q_cib, p=2, dim=-1, eps=epsilon)
-            neg_list.append(q_cib_norm)
-
-        # 3.3 当前 batch 中所有样本的 h1 也加入统一池
-        if batch_size > 0:
-            neg_list.append(h1_norm)
-
-        if len(neg_list) > 0:
-            neg_all = torch.cat(neg_list, dim=0)  # [N_all, 512]
-            N_total = neg_all.size(0)
-            if N_total > int(self.align_max_negatives):
-                perm = torch.randperm(N_total, device=device)
-                idx = perm[: int(self.align_max_negatives)]
-                neg_pool = neg_all[idx]              # [K, 512]
-            else:
-                neg_pool = neg_all                   # [N_total, 512]
-        else:
-            neg_pool = None
-
-        # 4) per-sample InfoNCE（统一 neg_pool，不再区分 benign / cib）
-        total_loss = 0.0
-        valid_count = 0
-
-        if (neg_pool is not None) and (neg_pool.size(0) > 0):
-            for i in range(batch_size):
-                anchor = h1_norm[i].unsqueeze(0)  # [1, 512]
-                pos = h2_norm[i].unsqueeze(0)     # [1, 512]
-
-                # 正样本：同一账号两种视角
-                sim_pos = torch.sum(anchor * pos, dim=-1, keepdim=True)  # [1, 1]
-                # 负样本：统一 memory bank + 当前 batch 的其他样本
-                sim_neg = torch.matmul(anchor, neg_pool.t())             # [1, N_neg]
-
-                logits = torch.cat([sim_pos, sim_neg], dim=-1) / temperature
-                target = torch.zeros(1, dtype=torch.long, device=device)  # index 0 为正样本
-
-                loss_i = F.cross_entropy(logits, target, reduction="mean")
-                total_loss += loss_i
-                valid_count += 1
-
-        # 5) 更新队列（仍按标签写入，不影响“使用时统一取样”的无监督对齐逻辑）
-        self._update_alignment_queues(h1, labels)
-
-        if valid_count == 0:
-            return torch.tensor(0.0, device=device)
-        return total_loss / valid_count
+        loss = F.cross_entropy(logits, targets, reduction="mean")
+        self._update_alignment_queue(h1)
+        return loss
         
     # ===================== CEE 计算 =====================
     def _compute_cee_for_states(self, states: torch.Tensor) -> torch.Tensor:
         """
-        对单个账号的状态序列计算 CEE 值。
+        用冻结的 mu_theta 对单个账号状态序列计算报告/正则用 CEE score。
 
         参数:
             states: [T, d]，这里 d = 2 * structure_dim (结构 + 文本投影拼接)
 
         返回:
-            cee: scalar，值越小表示轨迹越可预测（越像 CIB）。
+            scalar。默认 cee_score_mode=log_likelihood，值越高表示轨迹越可预测、越像真实用户模式。
         """
         device = states.device
         T = states.size(0)
         if T < 2:
             return torch.tensor(0.0, device=device)
-
-        log_probs = []
-        for t in range(T - 1):
-            s_t = states[t]       # [d]
-            s_tp1 = states[t + 1] # [d]
-            prob = self.cee_head(s_t, s_tp1)               # scalar in (0,1)
-            log_prob = torch.log(prob + 1e-8)              # 避免 log(0)
-            log_probs.append(log_prob)
-
-        log_probs = torch.stack(log_probs)                 # [T-1]
-        cee = -torch.mean(log_probs)                       # scalar
-        return cee
+        nll = self.cee_head.compute_cee(
+            states,
+            sigma=getattr(self.config, "cee_sigma", 1.0),
+            include_constant=bool(getattr(self.config, "cee_include_constant", True)),
+        )
+        return transform_cee_nll_to_score(nll, getattr(self.config, "cee_score_mode", "log_likelihood"))
 
     def compute_cee_loss(
         self,
@@ -530,14 +454,11 @@ class UnifiedTemporalGTLLM(nn.Module):
         labels: torch.Tensor,                 # [B]，0=normal,1=CIB
     ) -> torch.Tensor:
         """
-        Batch 级 L_CEE:
-          1) 对每个账号计算 CEE_i
-          2) 拆成 CIB / authentic 两组
-          3) 采用 ranking 约束: 希望 authentic 的 CEE 比 CIB 大 margin
+        Pairwise L_CEE:
+            默认使用 CEE score = log p(x_{t+1}|x_t)。
+            E_{v+,v-} max(0, score(v+) - score(v-) + delta_d)
 
-        Loss 形式与 config.cee_margin 注释一致:
-            希望  auth_cee > cib_cee + margin
-            因此  L_CEE = max(0, margin + mean(CEE_cib) - mean(CEE_auth))
+        v+ 是 CIB / malicious，v- 是 normal；目标方向是 normal 的 log-likelihood 更高。
         """
         device = structure_embeddings.device
         labels = labels.to(device)
@@ -576,19 +497,20 @@ class UnifiedTemporalGTLLM(nn.Module):
 
         if not (is_cib.any() and is_auth.any()):
             # 本 batch 没有同时包含两类，CEE 正则不生效
-            return torch.tensor(0.0, device=device)
+            return cee_values.sum() * 0.0
 
         cib_cee = cee_values[is_cib]               # [N_cib]
         auth_cee = cee_values[is_auth]             # [N_auth]
 
-        cib_mean = cib_cee.mean()
-        auth_mean = auth_cee.mean()
-
         margin = getattr(self.config, "cee_margin", 0.1)
 
-        # 希望 auth_cee > cib_cee + margin
-        # 违背时罚: margin + cib_mean - auth_mean > 0
-        l_cee = torch.clamp(margin + cib_mean - auth_mean, min=0.0)
+        score_mode = str(getattr(self.config, "cee_score_mode", "log_likelihood")).lower()
+        if score_mode in {"nll", "negative_log_likelihood", "raw_nll"}:
+            # raw NLL 越低越可预测；正常用户应低于 CIB。
+            l_cee = torch.relu(auth_cee[None, :] - cib_cee[:, None] + margin).mean()
+        else:
+            # log-likelihood 越高越可预测；正常用户应高于 CIB。
+            l_cee = torch.relu(cib_cee[:, None] - auth_cee[None, :] + margin).mean()
 
         return l_cee
 
@@ -722,6 +644,10 @@ class UnifiedTemporalGTLLM(nn.Module):
         text_mask: torch.Tensor,
         timesteps: torch.Tensor,
         attention_mask: torch.Tensor,
+        struct_in_embeddings_aug: Optional[torch.Tensor] = None,
+        struct_out_embeddings_aug: Optional[torch.Tensor] = None,
+        struct_in_mask_aug: Optional[torch.Tensor] = None,
+        struct_out_mask_aug: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         tokenizer=None,
     ) -> Dict[str, torch.Tensor]:
@@ -746,6 +672,14 @@ class UnifiedTemporalGTLLM(nn.Module):
         text_mask = text_mask.to(device)
         attention_mask = attention_mask.to(device)
         timesteps = timesteps.to(device)
+        if struct_in_embeddings_aug is not None:
+            struct_in_embeddings_aug = struct_in_embeddings_aug.to(device)
+        if struct_out_embeddings_aug is not None:
+            struct_out_embeddings_aug = struct_out_embeddings_aug.to(device)
+        if struct_in_mask_aug is not None:
+            struct_in_mask_aug = struct_in_mask_aug.to(device)
+        if struct_out_mask_aug is not None:
+            struct_out_mask_aug = struct_out_mask_aug.to(device)
 
         # --- 2. 节点级 -> 时间步级 (attention pooling) ---
         structure_embeddings, text_embeddings, attention_mask = self._pool_from_node_level(
@@ -758,14 +692,35 @@ class UnifiedTemporalGTLLM(nn.Module):
             attention_mask,   # 这里传的是时间步 mask
         )  # [B, T, 256], [B, T, 384], [B, T]
 
-        # --- 3. 对齐损失（InfoNCE + memory bank） ---
+        structure_embeddings_aug = None
+        has_aug_view = all(
+            x is not None
+            for x in (
+                struct_in_embeddings_aug,
+                struct_out_embeddings_aug,
+                struct_in_mask_aug,
+                struct_out_mask_aug,
+            )
+        )
+        if has_aug_view:
+            structure_embeddings_aug, _, _ = self._pool_from_node_level(
+                struct_in_embeddings_aug,
+                struct_out_embeddings_aug,
+                text_node_embeddings,
+                struct_in_mask_aug,
+                struct_out_mask_aug,
+                text_mask,
+                attention_mask,
+            )
+
+        # --- 3. 对齐损失（edge-drop InfoNCE + label-free memory bank） ---
         # 硬消融：当 lambda_align == 0 时，完全跳过计算与队列更新（不调用 compute_alignment_loss）。
         if (lambda_align is not None) and float(lambda_align) > 0.0:
             align_loss = self.compute_alignment_loss(
                 structure_embeddings,
+                structure_embeddings_aug,
                 text_embeddings,
                 attention_mask,
-                labels=labels,
                 temperature=getattr(self.config, "temperature", 0.07),
             )
         else:
@@ -836,12 +791,17 @@ class UnifiedTemporalGTLLM(nn.Module):
         # 3) 堆叠成 [B, 2]，作为二分类 logits
         logits_2 = torch.stack([benign_logits, malicious_logits], dim=-1).float()  # [B, 2]
 
-        # 4) 对这两个 logits 直接做交叉熵
-        gen_loss = F.cross_entropy(
-            logits_2,
-            labels.long(),
-            reduction="mean",
-        )
+        # 4) PU pairwise ranking 分类损失。CE 只保留为日志指标，不进入 total_loss。
+        score = logits_2[:, 1] - logits_2[:, 0]
+        pos_score = score[labels == 1]
+        neg_score = score[labels == 0]
+        if pos_score.numel() > 0 and neg_score.numel() > 0:
+            margin = float(getattr(self.config, "cls_margin", 0.3))
+            gen_loss = torch.relu(margin - (pos_score[:, None] - neg_score[None, :])).mean()
+        else:
+            gen_loss = score.sum() * 0.0
+
+        ce_loss = F.cross_entropy(logits_2, labels.long(), reduction="mean")
 
         # --- 7. 总损失 = 生成损失 + 对齐损失 + CEE 正则（权重可调） ---
 
@@ -856,6 +816,7 @@ class UnifiedTemporalGTLLM(nn.Module):
             "logits_2": logits_2,
             "align_loss": align_loss,
             "gen_loss": gen_loss,
+            "ce_loss": ce_loss,
             "cee_loss": cee_loss,
             "total_loss": total_loss,
         }
@@ -887,6 +848,15 @@ class UnifiedTemporalGTLLM(nn.Module):
         else:
             state_dict = checkpoint
 
+        skipped_cee_keys = [key for key in state_dict if key.startswith("cee_head.")]
+        if skipped_cee_keys:
+            state_dict = {
+                key: value
+                for key, value in state_dict.items()
+                if not key.startswith("cee_head.")
+            }
+            print(f"[load_model] skipped checkpoint cee_head.* keys: {len(skipped_cee_keys)}")
+
         missing_keys, unexpected_keys = self.load_state_dict(state_dict, strict=False)
 
         if len(missing_keys) > 0:
@@ -895,6 +865,7 @@ class UnifiedTemporalGTLLM(nn.Module):
             print(f"[load_model] unexpected_keys: {unexpected_keys[:10]} ... 共 {len(unexpected_keys)} 个")
 
         self.to(self.config.device)
+        self.cee_head.freeze()
 
         del checkpoint
         del state_dict

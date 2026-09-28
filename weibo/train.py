@@ -11,13 +11,15 @@ import datetime
 import random
 import time
 import gc
+import glob
 from typing import Dict, List, Tuple
 import torch.nn.functional as F
 from sklearn.metrics import confusion_matrix, roc_auc_score
 from config import TrainingConfig
 from utils import (
     find_paired_files, load_paired_embeddings, load_original_graph_data,
-    get_user_label, split_train_balanced_val_test_imbalanced
+    get_user_label, split_train_balanced_val_test_imbalanced, extract_node_id,
+    load_gat_embeddings,
 )
 from data_loader import create_data_loaders
 from unified_model import UnifiedTemporalGTLLM
@@ -323,6 +325,10 @@ def compute_scores_for_loader(model, data_loader, config):
                 text_mask=text_mask,
                 timesteps=timesteps,
                 attention_mask=time_mask,
+                struct_in_embeddings_aug=batch.get("struct_in_embeddings_aug", None).to(device) if "struct_in_embeddings_aug" in batch else None,
+                struct_out_embeddings_aug=batch.get("struct_out_embeddings_aug", None).to(device) if "struct_out_embeddings_aug" in batch else None,
+                struct_in_mask_aug=batch.get("struct_in_mask_aug", None).to(device) if "struct_in_mask_aug" in batch else None,
+                struct_out_mask_aug=batch.get("struct_out_mask_aug", None).to(device) if "struct_out_mask_aug" in batch else None,
                 labels=None,     # 推理阶段不算监督 loss
             )
 
@@ -540,6 +546,37 @@ def pareto_search_threshold(s_gen, labels, num_thresholds: int = 201, tie_break:
     return best, pareto, records
 
 
+def choose_validation_threshold(records_all, pareto_frontier, config):
+    """Select the classification threshold from validation records."""
+    rule = getattr(config, "threshold_selection_rule", "pareto_max_f1")
+    target_f1 = float(getattr(config, "target_f1", 0.65))
+    baseline_youden = float(getattr(config, "baseline_youden", 0.677000))
+
+    if rule == "val_target_balance":
+        return max(
+            records_all,
+            key=lambda r: (
+                min(r["f1"] / target_f1, r["j"] / baseline_youden),
+                r["f1"],
+                r["j"],
+            ),
+        )
+    if rule == "val_max_f1":
+        return max(records_all, key=lambda r: (r["f1"], r["precision"], -r["FP"], r["theta"]))
+    if rule == "val_max_j":
+        return max(records_all, key=lambda r: (r["j"], r["f1"], r["precision"], r["theta"]))
+    if rule == "val_max_j_f1_ge_065":
+        eligible = [r for r in records_all if r["f1"] >= target_f1]
+        return max(eligible or records_all, key=lambda r: (r["j"], r["f1"], r["precision"], r["theta"]))
+    if rule == "val_max_j_f1_ge_070":
+        eligible = [r for r in records_all if r["f1"] >= 0.70]
+        return max(eligible or records_all, key=lambda r: (r["j"], r["f1"], r["precision"], r["theta"]))
+    if rule == "pareto_max_f1":
+        return max(pareto_frontier, key=lambda r: (r["f1"], r["precision"], -r["FP"], r["theta"]))
+
+    raise ValueError(f"unknown threshold_selection_rule: {rule}")
+
+
 def plot_pareto_curves(records_all, pareto_frontier, best_rec, out_dir: str, tag: str):
     """
     画两张图：
@@ -601,84 +638,207 @@ def plot_pareto_curves(records_all, pareto_frontier, best_rec, out_dir: str, tag
 # ===================== Pareto 阈值选择 + 画图结束 =====================
 
 
+def _embedding_dir_pairs(config: TrainingConfig) -> List[Tuple[str, str, str]]:
+    pairs = [(config.gat_encoded_dir, config.text_encoded_dir, "primary")]
+    for idx, (gat_dir, text_dir) in enumerate(zip(config.extra_gat_encoded_dirs, config.extra_text_encoded_dirs), start=1):
+        pairs.append((gat_dir, text_dir, f"extra_normal_{idx}"))
+    return pairs
+
+
+def _normalize_timesteps(temporal_node_embeddings, temporal_text_embeddings, timesteps) -> List[int]:
+    if isinstance(timesteps, torch.Tensor):
+        timesteps_list = timesteps.view(-1).long().tolist()
+    elif isinstance(timesteps, np.ndarray):
+        timesteps_list = [int(x) for x in timesteps.reshape(-1).tolist()]
+    else:
+        timesteps_list = list(timesteps) if timesteps is not None else []
+
+    if len(timesteps_list) == 0:
+        ts_keys = set()
+        if isinstance(temporal_node_embeddings, dict):
+            ts_keys.update(list(temporal_node_embeddings.keys()))
+        if isinstance(temporal_text_embeddings, dict):
+            ts_keys.update(list(temporal_text_embeddings.keys()))
+        timesteps_list = list(ts_keys)
+
+    return sorted(int(t) for t in timesteps_list)
+
+
+def _load_edge_drop_map(edge_drop_dir: str, map_name: str = "edge-drop") -> Dict[str, Dict]:
+    if not edge_drop_dir or not os.path.exists(edge_drop_dir):
+        print(f"[EdgeDrop] {map_name} 增强目录不存在: {edge_drop_dir}")
+        return {}
+
+    gat_files = glob.glob(os.path.join(edge_drop_dir, "subgraph_*_k2_gat_encoded.pkl"))
+    edge_map: Dict[str, Dict] = {}
+    duplicate_nodes = 0
+    for gat_file in smart_tqdm(gat_files, desc="加载 edge-drop GAT"):
+        payload = load_gat_embeddings(gat_file)
+        if payload is None:
+            continue
+        node_id = str(payload.get("node_id", extract_node_id(gat_file)))
+        if node_id in edge_map:
+            duplicate_nodes += 1
+        edge_map[node_id] = payload.get("temporal_node_embeddings", {})
+
+    print(f"[EdgeDrop] 加载 {map_name} 增强结构视图: {len(edge_map)} 个节点, duplicate_nodes={duplicate_nodes}")
+    return edge_map
+
+
+def _edge_drop_lookup_ids(node_id: str, graph_data: Dict) -> List[str]:
+    lookup_ids = [str(node_id)]
+    if not isinstance(graph_data, dict):
+        return lookup_ids
+
+    id_to_user = graph_data.get("id_to_user", {}) or {}
+    user_id_to_names = graph_data.get("user_id_to_names", {}) or {}
+    screen_name_to_user_id = graph_data.get("screen_name_to_user_id", {}) or {}
+    user_to_id = graph_data.get("user_to_id", {}) or {}
+    user_to_primary_id = graph_data.get("user_to_primary_id", {}) or {}
+
+    def add_user_name_and_ids(user_name: str):
+        if user_name is None:
+            return
+        user_name = str(user_name)
+        lookup_ids.append(user_name)
+        for mapping in (screen_name_to_user_id, user_to_id, user_to_primary_id):
+            if user_name in mapping:
+                lookup_ids.append(str(mapping[user_name]))
+
+    add_user_name_and_ids(str(node_id))
+
+    try:
+        node_id_int = int(node_id)
+        for names_key in (node_id, node_id_int):
+            if names_key in user_id_to_names:
+                for user_name in user_id_to_names[names_key]:
+                    add_user_name_and_ids(user_name)
+        if node_id_int in id_to_user:
+            add_user_name_and_ids(id_to_user[node_id_int])
+    except Exception:
+        if node_id in user_id_to_names:
+            for user_name in user_id_to_names[node_id]:
+                add_user_name_and_ids(user_name)
+        pass
+
+    seen = set()
+    deduped = []
+    for value in lookup_ids:
+        if value not in seen:
+            seen.add(value)
+            deduped.append(value)
+    return deduped
+
+
+def _load_edge_drop_for_node(edge_drop_dir: str, node_id: str, graph_data: Dict) -> Dict:
+    if not edge_drop_dir or not os.path.exists(edge_drop_dir):
+        return {}
+    for lookup_id in _edge_drop_lookup_ids(str(node_id), graph_data):
+        edge_path = os.path.join(edge_drop_dir, f"subgraph_{lookup_id}_k2_gat_encoded.pkl")
+        if not os.path.exists(edge_path):
+            continue
+        payload = load_gat_embeddings(edge_path)
+        if payload is None:
+            continue
+        return payload.get("temporal_node_embeddings", {}) or {}
+    return {}
+
+
 def load_all_data(config: TrainingConfig) -> Tuple[Dict, Dict, Dict]:
-    """
-    加载所有数据（仅保留“新格式”：节点级表示）
-
-    期望 load_paired_embeddings 返回：
-        - 'temporal_node_embeddings': {t: {
-                'in_node_embeddings':  Tensor/ndarray [N_in_t,128],
-                'out_node_embeddings': Tensor/ndarray [N_out_t,128]
-          }}
-        - 'temporal_text_embeddings': {t: Tensor/ndarray [N_txt_t,384]}
-        - 'timesteps':               List[int] 或 1D Tensor
-        - 'node_id':                 节点 ID
-    """
+    """加载主 embedding + extra normal embedding，并挂载 edge-drop 结构视图。"""
     print("=" * 60)
-    print("加载数据...(仅使用节点级新格式)")
+    print("加载数据...(主目录 + normal_42000 + edge-drop 结构视图)")
     print("=" * 60)
 
-    # 1. 查找配对文件
-    paired_files = find_paired_files(config.gat_encoded_dir, config.text_encoded_dir)
-
-    # 2. 加载原始图数据（用于标签）
     graph_data = load_original_graph_data(config.original_graph_data_path)
+    lazy_edge_drop = bool(getattr(config, "lazy_load_edge_drop", False))
+    if lazy_edge_drop:
+        print("[EdgeDrop] 使用按节点懒加载，避免全量读取 edge-drop 目录。")
+        shared_edge_drop_map = {}
+        primary_edge_drop_map = {}
+    else:
+        shared_edge_drop_map = _load_edge_drop_map(getattr(config, "edge_drop_gat_encoded_dir", ""), "shared")
+        primary_edge_drop_map = _load_edge_drop_map(
+            getattr(config, "primary_edge_drop_gat_encoded_dir", ""),
+            "primary_patch",
+        )
 
-    # 3. 加载所有节点的嵌入和标签
     node_data: Dict[str, Dict] = {}
     labels: Dict[str, int] = {}
+    source_stats: Dict[str, Dict[str, int]] = {}
 
-    successful_nodes = 0
+    for gat_dir, text_dir, source_name in _embedding_dir_pairs(config):
+        paired_files = find_paired_files(gat_dir, text_dir)
+        max_extra = getattr(config, "max_extra_normal_samples", None)
+        if source_name.startswith("extra_normal") and max_extra is not None:
+            max_extra = max(0, int(max_extra))
+            if len(paired_files) > max_extra:
+                print(f"[DataLoad] {source_name} 仅加载前 {max_extra}/{len(paired_files)} 对，用于满足 1:50 评估比例。")
+                paired_files = paired_files[:max_extra]
+        source_stats[source_name] = {"paired": len(paired_files), "loaded": 0, "duplicates_skipped": 0}
 
-    for gat_file, text_file in smart_tqdm(paired_files, desc="加载节点数据"):
-        embeddings = load_paired_embeddings(gat_file, text_file)
-        if embeddings is None:
-            continue
+        for gat_file, text_file in smart_tqdm(paired_files, desc=f"加载节点数据:{source_name}"):
+            embeddings = load_paired_embeddings(gat_file, text_file)
+            if embeddings is None:
+                continue
 
-        node_id = embeddings.get("node_id", None)
-        if node_id is None:
-            continue
+            node_id = embeddings.get("node_id", None)
+            if node_id is None:
+                continue
+            node_id = str(node_id)
 
-        has_label, label = get_user_label(node_id, graph_data)
-        if not has_label:
-            continue
+            if node_id in node_data:
+                source_stats[source_name]["duplicates_skipped"] += 1
+                continue
 
-        temporal_node_embeddings = embeddings.get("temporal_node_embeddings", {})
-        temporal_text_embeddings = embeddings.get("temporal_text_embeddings", {})
-        timesteps = embeddings.get("timesteps", [])
+            has_label, label = get_user_label(node_id, graph_data)
+            if not has_label:
+                continue
 
-        if isinstance(timesteps, torch.Tensor):
-            timesteps_list = timesteps.view(-1).long().tolist()
-        else:
-            timesteps_list = list(timesteps)
+            temporal_node_embeddings = embeddings.get("temporal_node_embeddings", {})
+            temporal_text_embeddings = embeddings.get("temporal_text_embeddings", {})
+            timesteps_sorted = _normalize_timesteps(
+                temporal_node_embeddings,
+                temporal_text_embeddings,
+                embeddings.get("timesteps", []),
+            )
 
-        if len(timesteps_list) == 0:
-            ts_keys = set()
-            if isinstance(temporal_node_embeddings, dict):
-                ts_keys.update(list(temporal_node_embeddings.keys()))
-            if isinstance(temporal_text_embeddings, dict):
-                ts_keys.update(list(temporal_text_embeddings.keys()))
-            timesteps_list = list(ts_keys)
+            if len(timesteps_sorted) == 0:
+                continue
+            if (not isinstance(temporal_node_embeddings, dict) or len(temporal_node_embeddings) == 0) and \
+               (not isinstance(temporal_text_embeddings, dict) or len(temporal_text_embeddings) == 0):
+                continue
 
-        if len(timesteps_list) == 0:
-            continue
+            item = {
+                "temporal_node_embeddings": temporal_node_embeddings,
+                "temporal_text_embeddings": temporal_text_embeddings,
+                "timesteps": timesteps_sorted,
+                "embedding_source": source_name,
+            }
+            if lazy_edge_drop:
+                if source_name == "primary":
+                    aug = _load_edge_drop_for_node(getattr(config, "primary_edge_drop_gat_encoded_dir", ""), node_id, graph_data)
+                    if not aug:
+                        aug = _load_edge_drop_for_node(getattr(config, "edge_drop_gat_encoded_dir", ""), node_id, graph_data)
+                else:
+                    aug = _load_edge_drop_for_node(getattr(config, "edge_drop_gat_encoded_dir", ""), node_id, graph_data)
+                if aug:
+                    item["temporal_node_embeddings_aug"] = aug
+            else:
+                if source_name == "primary" and node_id in primary_edge_drop_map:
+                    item["temporal_node_embeddings_aug"] = primary_edge_drop_map[node_id]
+                elif node_id in shared_edge_drop_map:
+                    item["temporal_node_embeddings_aug"] = shared_edge_drop_map[node_id]
 
-        timesteps_sorted = sorted(int(t) for t in timesteps_list)
+            node_data[node_id] = item
+            labels[node_id] = int(label)
+            source_stats[source_name]["loaded"] += 1
 
-        if (not isinstance(temporal_node_embeddings, dict) or len(temporal_node_embeddings) == 0) and \
-           (not isinstance(temporal_text_embeddings, dict) or len(temporal_text_embeddings) == 0):
-            continue
-
-        node_data[node_id] = {
-            "temporal_node_embeddings": temporal_node_embeddings,
-            "temporal_text_embeddings": temporal_text_embeddings,
-            "timesteps": timesteps_sorted,
-        }
-        labels[node_id] = label
-        successful_nodes += 1
-
-    print(f"数据加载完成: {successful_nodes} 个节点")
+    edge_aug_count = sum(1 for v in node_data.values() if "temporal_node_embeddings_aug" in v)
+    print(f"数据加载完成: {len(node_data)} 个节点")
     print(f"标签分布: 恶意={sum(labels.values())}, 正常={len(labels) - sum(labels.values())}")
+    print(f"edge-drop 增强可用: {edge_aug_count}/{len(node_data)}")
+    print(f"来源统计: {source_stats}")
 
     return node_data, labels, graph_data
 
@@ -724,6 +884,10 @@ def train_one_epoch(model, train_loader, optimizer, scheduler, config, epoch, fo
             text_mask=text_mask,
             timesteps=timesteps,
             attention_mask=time_mask,
+            struct_in_embeddings_aug=batch.get("struct_in_embeddings_aug", None).to(device) if "struct_in_embeddings_aug" in batch else None,
+            struct_out_embeddings_aug=batch.get("struct_out_embeddings_aug", None).to(device) if "struct_out_embeddings_aug" in batch else None,
+            struct_in_mask_aug=batch.get("struct_in_mask_aug", None).to(device) if "struct_in_mask_aug" in batch else None,
+            struct_out_mask_aug=batch.get("struct_out_mask_aug", None).to(device) if "struct_out_mask_aug" in batch else None,
             labels=labels,
         )
 
@@ -859,6 +1023,10 @@ def validate(model, val_loader, config, tokenizer, epoch, fold_idx):
                 text_mask=text_mask,
                 timesteps=timesteps,
                 attention_mask=time_mask,
+                struct_in_embeddings_aug=batch.get("struct_in_embeddings_aug", None).to(device) if "struct_in_embeddings_aug" in batch else None,
+                struct_out_embeddings_aug=batch.get("struct_out_embeddings_aug", None).to(device) if "struct_out_embeddings_aug" in batch else None,
+                struct_in_mask_aug=batch.get("struct_in_mask_aug", None).to(device) if "struct_in_mask_aug" in batch else None,
+                struct_out_mask_aug=batch.get("struct_out_mask_aug", None).to(device) if "struct_out_mask_aug" in batch else None,
                 labels=labels,
             )
 
@@ -1186,6 +1354,111 @@ def plot_losses(train_history: List[Dict], fold_output_dir: str, fold_idx: int):
     print(f"[可视化] CEE Loss 曲线已保存到: {cee_fig_path}")
 
 
+def split_class_counts(node_ids: List[str], labels: Dict[str, int]) -> Dict[str, float]:
+    total = len(node_ids)
+    malicious = int(sum(1 for nid in node_ids if int(labels.get(nid, 0)) == 1))
+    normal = int(total - malicious)
+    return {
+        "total": int(total),
+        "malicious": malicious,
+        "normal": normal,
+        "normal_per_malicious": float(normal / malicious) if malicious > 0 else None,
+    }
+
+
+def build_split_payload(
+    train_node_ids: List[str],
+    val_node_ids: List[str],
+    test_node_ids: List[str],
+    labels: Dict[str, int],
+    config: TrainingConfig,
+) -> Dict:
+    return {
+        "train_node_ids": train_node_ids,
+        "val_node_ids": val_node_ids,
+        "test_node_ids": test_node_ids,
+        "split_seed": getattr(config, "split_seed", 42),
+        "val_test_neg_pos_ratio": getattr(config, "val_test_neg_pos_ratio", None),
+        "class_counts": {
+            "train": split_class_counts(train_node_ids, labels),
+            "val": split_class_counts(val_node_ids, labels),
+            "test": split_class_counts(test_node_ids, labels),
+        },
+    }
+
+
+def assert_split_protocol(payload: Dict, labels: Dict[str, int], expected_ratio) -> None:
+    counts = payload.get("class_counts") or {
+        "train": split_class_counts(payload.get("train_node_ids", []), labels),
+        "val": split_class_counts(payload.get("val_node_ids", []), labels),
+        "test": split_class_counts(payload.get("test_node_ids", []), labels),
+    }
+
+    train = counts["train"]
+    if train["malicious"] != train["normal"]:
+        raise RuntimeError(f"训练集不是 1:1: {train}")
+
+    if expected_ratio is not None:
+        ratio = int(expected_ratio)
+        for split_name in ("val", "test"):
+            c = counts[split_name]
+            if c["normal"] != c["malicious"] * ratio:
+                raise RuntimeError(f"{split_name} 不是恶意:正常=1:{ratio}: {c}")
+
+
+def can_reuse_split(split_data: Dict, config: TrainingConfig, labels: Dict[str, int], node_data: Dict) -> bool:
+    expected_seed = getattr(config, "split_seed", 42)
+    expected_ratio = getattr(config, "val_test_neg_pos_ratio", None)
+    if split_data.get("split_seed", None) != expected_seed:
+        print(f"已有划分 split_seed={split_data.get('split_seed', None)} 与当前配置 {expected_seed} 不一致，将重新划分。")
+        return False
+    if split_data.get("val_test_neg_pos_ratio", None) != expected_ratio:
+        print(f"已有划分 val_test_neg_pos_ratio={split_data.get('val_test_neg_pos_ratio', None)} 与当前配置 {expected_ratio} 不一致，将重新划分。")
+        return False
+
+    all_ids = split_data.get("train_node_ids", []) + split_data.get("val_node_ids", []) + split_data.get("test_node_ids", [])
+    missing_ids = [nid for nid in all_ids if nid not in node_data or nid not in labels]
+    if missing_ids:
+        print(f"已有划分中有 {len(missing_ids)} 个节点当前未加载，将重新划分。")
+        return False
+
+    try:
+        payload = build_split_payload(
+            split_data.get("train_node_ids", []),
+            split_data.get("val_node_ids", []),
+            split_data.get("test_node_ids", []),
+            labels,
+            config,
+        )
+        assert_split_protocol(payload, labels, expected_ratio)
+    except RuntimeError as exc:
+        print(f"已有划分比例不满足当前协议，将重新划分: {exc}")
+        return False
+
+    return True
+
+
+def verify_training_assets(train_node_ids: List[str], node_data: Dict, config: TrainingConfig) -> None:
+    if float(getattr(config, "lambda_align", 0.0)) > 0.0 and bool(getattr(config, "require_edge_drop_alignment", True)):
+        missing_aug = [nid for nid in train_node_ids if "temporal_node_embeddings_aug" not in node_data.get(nid, {})]
+        if missing_aug:
+            preview = missing_aug[:10]
+            raise RuntimeError(
+                "训练集缺少 edge-drop GAT 增强视图，不能启动 L_cont。"
+                f" missing={len(missing_aug)}, preview={preview}. "
+                "先用 gat_encoder.py 生成 gat_encoded_subgraphs_edge_drop。"
+            )
+
+    cee_path = getattr(config, "cee_head_path", "")
+    if cee_path and not os.path.isabs(cee_path):
+        cee_path = os.path.abspath(cee_path)
+    if bool(getattr(config, "require_pretrained_cee", True)) and not os.path.exists(cee_path):
+        raise RuntimeError(
+            f"缺少冻结 CEE dynamics checkpoint: {cee_path}. "
+            "先运行 python pretrain_cee_head.py，再运行 python train.py。"
+        )
+
+
 def train_one_fold(model: UnifiedTemporalGTLLM, train_loader, val_loader,
                    config: TrainingConfig, fold_idx: int, output_dir: str, tokenizer=None) -> Dict[str, float]:
     """
@@ -1430,32 +1703,55 @@ def train_one_fold(model: UnifiedTemporalGTLLM, train_loader, val_loader,
         # ===== 追加：对 best_model 在验证集上重算 Pareto 前沿，并保存前沿与图 =====
         try:
             s_gen_val_best, y_val_best, _ = compute_scores_for_loader(model, val_loader, config)
-            best_rec_b, pareto_frontier_b, records_all_b = pareto_search_threshold(
+            pareto_best_rec_b, pareto_frontier_b, records_all_b = pareto_search_threshold(
                 s_gen_val_best, y_val_best, num_thresholds=201, tie_break="higher_precision"
             )
+            selected_threshold_rec = choose_validation_threshold(records_all_b, pareto_frontier_b, config)
 
             pareto_plot_dir = os.path.join(fold_output_dir, "pareto_plots")
             tag = f"best_epoch{best_epoch_idx:03d}" if best_epoch_idx is not None else "best_epoch"
-            out2d_b, out3d_b = plot_pareto_curves(records_all_b, pareto_frontier_b, best_rec_b, pareto_plot_dir, tag=tag)
+            out2d_b, out3d_b = plot_pareto_curves(records_all_b, pareto_frontier_b, selected_threshold_rec, pareto_plot_dir, tag=tag)
 
             fold_summary["best_thresholds"]["pareto_selection"] = {
                 "selection_rule": "pareto_max_f1",
-                "theta": float(best_rec_b["theta"]),
-                "f1": float(best_rec_b["f1"]),
-                "j": float(best_rec_b["j"]),
-                "precision": float(best_rec_b["precision"]),
-                "recall": float(best_rec_b["recall"]),
-                "fpr": float(best_rec_b["fpr"]),
-                "TN": int(best_rec_b["TN"]),
-                "FP": int(best_rec_b["FP"]),
-                "FN": int(best_rec_b["FN"]),
-                "TP": int(best_rec_b["TP"]),
+                "theta": float(pareto_best_rec_b["theta"]),
+                "f1": float(pareto_best_rec_b["f1"]),
+                "j": float(pareto_best_rec_b["j"]),
+                "precision": float(pareto_best_rec_b["precision"]),
+                "recall": float(pareto_best_rec_b["recall"]),
+                "fpr": float(pareto_best_rec_b["fpr"]),
+                "TN": int(pareto_best_rec_b["TN"]),
+                "FP": int(pareto_best_rec_b["FP"]),
+                "FN": int(pareto_best_rec_b["FN"]),
+                "TP": int(pareto_best_rec_b["TP"]),
                 "pareto_size": int(len(pareto_frontier_b)),
                 "pareto_plots": {
                     "f1_vs_j_2d": out2d_b,
                     "theta_f1_j_3d": out3d_b
                 }
             }
+
+            threshold_rule = getattr(config, "threshold_selection_rule", "pareto_max_f1")
+            fold_summary["test_threshold_selection"] = {
+                "selection_rule": threshold_rule,
+                "theta": float(selected_threshold_rec["theta"]),
+                "f1": float(selected_threshold_rec["f1"]),
+                "j": float(selected_threshold_rec["j"]),
+                "precision": float(selected_threshold_rec["precision"]),
+                "recall": float(selected_threshold_rec["recall"]),
+                "fpr": float(selected_threshold_rec["fpr"]),
+                "TN": int(selected_threshold_rec["TN"]),
+                "FP": int(selected_threshold_rec["FP"]),
+                "FN": int(selected_threshold_rec["FN"]),
+                "TP": int(selected_threshold_rec["TP"]),
+            }
+            fold_summary["selected_test_theta"] = float(selected_threshold_rec["theta"])
+            fold_summary["selected_test_threshold_rule"] = threshold_rule
+            print(
+                f"  测试阈值选择规则: {threshold_rule}, "
+                f"theta={selected_threshold_rec['theta']:.4f}, "
+                f"val_F1={selected_threshold_rec['f1']:.4f}, val_J={selected_threshold_rec['j']:.4f}"
+            )
 
             # 仅保存 Pareto 前沿（规模小，可读性强）
             fold_summary["pareto_frontier"] = [
@@ -1511,6 +1807,10 @@ def main():
     print(f"backbone_init_mode: {config.backbone_init_mode}")
     print(f"num_runs: {config.num_runs}, random_seeds: {config.random_seeds}")
     print(f"val_test_neg_pos_ratio: {getattr(config, 'val_test_neg_pos_ratio', None)}")
+    print(f"LoRA: r={config.lora_rank}, alpha={config.lora_alpha}, dropout={config.lora_dropout}, target_modules={config.target_modules}")
+    print(f"loss weights: lambda_gen={config.lambda_gen}, lambda_align={config.lambda_align}, lambda_cee={config.lambda_cee}")
+    print(f"align_max_negatives: {getattr(config, 'align_max_negatives', None)}")
+    print(f"threshold_selection_rule: {getattr(config, 'threshold_selection_rule', 'pareto_max_f1')}")
 
     # 1. 加载全部节点数据与标签
     node_data, labels, graph_data = load_all_data(config)
@@ -1528,21 +1828,10 @@ def main():
     split_path = os.path.join(config.output_dir, "dataset_split.json")
     expected_ratio = getattr(config, "val_test_neg_pos_ratio", None)
 
-    def _can_reuse_existing_split(split_data: Dict) -> bool:
-        saved_seed = split_data.get("split_seed", None)
-        saved_ratio = split_data.get("val_test_neg_pos_ratio", None)
-        if saved_seed != getattr(config, "split_seed", 42):
-            print(f"已有划分 split_seed={saved_seed} 与当前配置 {getattr(config, 'split_seed', 42)} 不一致，将重新划分。")
-            return False
-        if saved_ratio != expected_ratio:
-            print(f"已有划分 val_test_neg_pos_ratio={saved_ratio} 与当前配置 {expected_ratio} 不一致，将重新划分。")
-            return False
-        return True
-
     if config.reuse_existing_split and os.path.exists(split_path):
         with open(split_path, "r") as f:
             split_data = json.load(f)
-        if _can_reuse_existing_split(split_data):
+        if can_reuse_split(split_data, config, labels, node_data):
             train_node_ids = split_data["train_node_ids"]
             val_node_ids = split_data["val_node_ids"]
             test_node_ids = split_data["test_node_ids"]
@@ -1557,13 +1846,9 @@ def main():
                 seed=getattr(config, "split_seed", 42),
                 val_test_neg_pos_ratio=expected_ratio,
             )
-            save_json(split_path, {
-                "train_node_ids": train_node_ids,
-                "val_node_ids": val_node_ids,
-                "test_node_ids": test_node_ids,
-                "split_seed": getattr(config, "split_seed", 42),
-                "val_test_neg_pos_ratio": expected_ratio,
-            })
+            split_payload = build_split_payload(train_node_ids, val_node_ids, test_node_ids, labels, config)
+            assert_split_protocol(split_payload, labels, expected_ratio)
+            save_json(split_path, split_payload)
             print(f"数据集划分结果已保存到: {split_path}")
     else:
         train_node_ids, val_node_ids, test_node_ids = split_train_balanced_val_test_imbalanced(
@@ -1575,14 +1860,12 @@ def main():
             seed=getattr(config, "split_seed", 42),
             val_test_neg_pos_ratio=expected_ratio,
         )
-        save_json(split_path, {
-            "train_node_ids": train_node_ids,
-            "val_node_ids": val_node_ids,
-            "test_node_ids": test_node_ids,
-            "split_seed": getattr(config, "split_seed", 42),
-            "val_test_neg_pos_ratio": expected_ratio,
-        })
+        split_payload = build_split_payload(train_node_ids, val_node_ids, test_node_ids, labels, config)
+        assert_split_protocol(split_payload, labels, expected_ratio)
+        save_json(split_path, split_payload)
         print(f"数据集划分结果已保存到: {split_path}")
+
+    verify_training_assets(train_node_ids, node_data, config)
 
     def count_stats(node_ids_subset):
         total = len(node_ids_subset)
@@ -1617,6 +1900,7 @@ def main():
         print(f"开始 Run {run_idx + 1}/{config.num_runs} | seed={run_seed}")
         print("=" * 80)
         set_global_seed(run_seed)
+        config.current_run_seed = run_seed
 
         # 每个 run 重新构造 DataLoader，训练集 shuffle 顺序随 seed 改变
         train_loader, val_loader, train_dataset, val_dataset = create_data_loaders(
@@ -1648,11 +1932,20 @@ def main():
         if getattr(config.device, "type", "") == "cuda":
             torch.cuda.empty_cache()
 
-        best_theta = float(res.get("best_val_theta", 0.5) if res.get("best_val_theta", None) is not None else 0.5)
+        threshold_info = res.get("test_threshold_selection", {}) or {}
+        selected_theta = threshold_info.get(
+            "theta",
+            res.get("selected_test_theta", res.get("best_val_theta", 0.5)),
+        )
+        best_theta = float(selected_theta if selected_theta is not None else 0.5)
         test_metrics = evaluate_best_model_on_test(
             res["best_model_path"], best_theta, test_loader, config, tokenizer
         )
         res["test_metrics"] = test_metrics
+        res["test_threshold_used"] = {
+            "selection_rule": threshold_info.get("selection_rule", getattr(config, "threshold_selection_rule", "pareto_max_f1")),
+            "theta": best_theta,
+        }
 
         fold_output_dir = os.path.join(config.output_dir, f"fold_{run_idx + 1}")
         fold_summary_path = os.path.join(fold_output_dir, "fold_summary.json")
@@ -1665,6 +1958,7 @@ def main():
         fold_summary["backbone_init_mode"] = config.backbone_init_mode
         fold_summary["experiment_name"] = config.experiment_name
         fold_summary["test_metrics"] = test_metrics
+        fold_summary["test_threshold_used"] = res["test_threshold_used"]
         save_json(fold_summary_path, fold_summary)
 
         run_results.append(res)
@@ -1696,6 +1990,10 @@ def main():
 - num_runs: {config.num_runs}
 - random_seeds: {config.random_seeds}
 - split_seed: {config.split_seed}
+- LoRA: r={config.lora_rank}, alpha={config.lora_alpha}, dropout={config.lora_dropout}, target_modules={config.target_modules}
+- loss weights: lambda_gen={config.lambda_gen}, lambda_align={config.lambda_align}, lambda_cee={config.lambda_cee}
+- align_max_negatives: {getattr(config, 'align_max_negatives', None)}
+- threshold_selection_rule: {getattr(config, 'threshold_selection_rule', 'pareto_max_f1')}
 
 ## 文件说明
 - `config.json`: 训练配置

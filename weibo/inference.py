@@ -2,8 +2,13 @@ import os
 import json
 import glob
 import gc
+import hashlib
 from typing import Dict, List, Tuple
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -20,6 +25,7 @@ from utils import (
 from data_loader import TemporalGraphTextDataset, collate_fn
 from unified_model import UnifiedTemporalGTLLM
 from transformers import AutoTokenizer
+from train import load_all_data as load_training_data
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -28,73 +34,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # 1. 加载所有节点数据（节点级新格式，和 train.py 保持一致）
 # ============================================================
 def load_all_data(config: TrainingConfig) -> Tuple[Dict, Dict, Dict]:
-    print("=" * 60)
-    print("推理阶段：加载数据（全体用户，节点级表示）...")
-    print("=" * 60)
-
-    paired_files = find_paired_files(config.gat_encoded_dir, config.text_encoded_dir)
-    graph_data = load_original_graph_data(config.original_graph_data_path)
-
-    node_data: Dict[str, Dict] = {}
-    labels: Dict[str, int] = {}
-    successful_nodes = 0
-
-    for gat_file, text_file in tqdm(paired_files, desc="加载节点数据"):
-        embeddings = load_paired_embeddings(gat_file, text_file)
-        if embeddings is None:
-            continue
-
-        node_id = embeddings.get("node_id", None)
-        if node_id is None:
-            continue
-
-        has_label, label = get_user_label(node_id, graph_data)
-        if not has_label:
-            continue
-
-        temporal_node_embeddings = embeddings.get("temporal_node_embeddings", {})
-        temporal_text_embeddings = embeddings.get("temporal_text_embeddings", {})
-        timesteps = embeddings.get("timesteps", [])
-
-        if isinstance(timesteps, torch.Tensor):
-            timesteps_list = timesteps.long().tolist()
-        elif isinstance(timesteps, np.ndarray):
-            timesteps_list = [int(x) for x in timesteps.tolist()]
-        elif isinstance(timesteps, (list, tuple)):
-            timesteps_list = [int(x) for x in timesteps]
-        else:
-            timesteps_list = []
-
-        if len(timesteps_list) == 0:
-            ts_keys = set()
-            if isinstance(temporal_node_embeddings, dict):
-                ts_keys.update(list(temporal_node_embeddings.keys()))
-            if isinstance(temporal_text_embeddings, dict):
-                ts_keys.update(list(temporal_text_embeddings.keys()))
-            timesteps_list = [int(t) for t in ts_keys]
-
-        if len(timesteps_list) == 0:
-            continue
-
-        timesteps_sorted = sorted(int(t) for t in timesteps_list)
-
-        if (
-            (not isinstance(temporal_node_embeddings, dict) or len(temporal_node_embeddings) == 0)
-            and (not isinstance(temporal_text_embeddings, dict) or len(temporal_text_embeddings) == 0)
-        ):
-            continue
-
-        node_data[node_id] = {
-            "temporal_node_embeddings": temporal_node_embeddings,
-            "temporal_text_embeddings": temporal_text_embeddings,
-            "timesteps": timesteps_sorted,
-        }
-        labels[node_id] = int(label)
-        successful_nodes += 1
-
-    print(f"数据加载完成: {successful_nodes} 个节点(用户)")
-    print(f"标签分布: 恶意={sum(labels.values())}, 正常={len(labels) - sum(labels.values())}")
-    return node_data, labels, graph_data
+    return load_training_data(config)
 
 
 # ============================================================
@@ -191,6 +131,282 @@ def compute_scores_for_loader(
             all_cee.extend(batch_cee)
 
     return np.array(all_s_gen), np.array(all_labels), all_node_ids, np.array(all_cee)
+
+
+def file_sha256(path: str) -> str:
+    if not path or not os.path.exists(path):
+        return ""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def summarize_cee_groups(cee_scores: np.ndarray, labels: np.ndarray, config: TrainingConfig) -> Dict:
+    cee_scores = np.asarray(cee_scores, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.int32)
+    score_mode = str(getattr(config, "cee_score_mode", "log_likelihood")).lower()
+    is_log_likelihood = score_mode in {"log_likelihood", "logp", "log_likelihood_score"}
+    out = {
+        "cee_head_path": os.path.abspath(getattr(config, "cee_head_path", "")),
+        "cee_head_sha256": file_sha256(os.path.abspath(getattr(config, "cee_head_path", ""))),
+        "cee_score_mode": score_mode,
+        "cee_score_definition": "log p(x_{t+1}|x_t) = - Gaussian autoregressive NLL" if is_log_likelihood else "Gaussian autoregressive negative log-likelihood",
+        "score_orientation": "higher means easier to predict under the frozen dynamics model" if is_log_likelihood else "lower means easier to predict under the frozen dynamics model",
+        "groups": {},
+    }
+
+    for name, value in [("normal", 0), ("malicious", 1)]:
+        arr = cee_scores[labels == value]
+        if arr.size == 0:
+            out["groups"][name] = {"n": 0}
+            continue
+        out["groups"][name] = {
+            "n": int(arr.size),
+            "mean": float(np.mean(arr)),
+            "median": float(np.median(arr)),
+            "std": float(np.std(arr)),
+            "q1": float(np.quantile(arr, 0.25)),
+            "q3": float(np.quantile(arr, 0.75)),
+        }
+
+    normal = cee_scores[labels == 0]
+    malicious = cee_scores[labels == 1]
+    if normal.size > 0 and malicious.size > 0:
+        try:
+            from scipy.stats import mannwhitneyu
+
+            u_stat, p_value = mannwhitneyu(malicious, normal, alternative="two-sided")
+            n_total = malicious.size + normal.size
+            z_approx = (float(u_stat) - malicious.size * normal.size / 2.0) / np.sqrt(
+                malicious.size * normal.size * (n_total + 1) / 12.0
+            )
+            out["mann_whitney_u"] = {
+                "u_statistic": float(u_stat),
+                "p_value": float(p_value),
+                "effect_size_r_approx": float(abs(z_approx) / np.sqrt(n_total)),
+            }
+        except Exception as exc:
+            out["mann_whitney_u"] = {"error": str(exc)}
+    return out
+
+
+def _records_from_indices(
+    indices: np.ndarray,
+    node_ids: List[str],
+    labels: np.ndarray,
+    s_gen: np.ndarray,
+    cee_scores: np.ndarray,
+    y_pred: np.ndarray,
+) -> List[Dict]:
+    records = []
+    for idx in indices.tolist():
+        records.append({
+            "node_id": str(node_ids[idx]),
+            "label": int(labels[idx]),
+            "score": float(s_gen[idx]),
+            "cee_score": float(cee_scores[idx]),
+            "cee": float(cee_scores[idx]),
+            "y_pred": int(y_pred[idx]),
+        })
+    return records
+
+
+def _cee_stats(values: np.ndarray) -> Dict:
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return {"n": 0}
+    return {
+        "n": int(values.size),
+        "mean": float(np.mean(values)),
+        "median": float(np.median(values)),
+        "std": float(np.std(values)),
+        "q1": float(np.quantile(values, 0.25)),
+        "q3": float(np.quantile(values, 0.75)),
+    }
+
+
+def _mann_whitney_payload(x: np.ndarray, y: np.ndarray) -> Dict:
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    x = x[np.isfinite(x)]
+    y = y[np.isfinite(y)]
+    if x.size == 0 or y.size == 0:
+        return {"error": "empty group", "n_x": int(x.size), "n_y": int(y.size)}
+
+    try:
+        from scipy.stats import mannwhitneyu
+
+        u_stat, p_value = mannwhitneyu(x, y, alternative="two-sided")
+        n_total = x.size + y.size
+        z_approx = (float(u_stat) - x.size * y.size / 2.0) / np.sqrt(
+            x.size * y.size * (n_total + 1) / 12.0
+        )
+        return {
+            "u_statistic": float(u_stat),
+            "p_value": float(p_value),
+            "effect_size_r_approx": float(abs(z_approx) / np.sqrt(n_total)),
+            "n_x": int(x.size),
+            "n_y": int(y.size),
+        }
+    except Exception as exc:
+        return {"error": str(exc), "n_x": int(x.size), "n_y": int(y.size)}
+
+
+def _plot_cdf(ax, values: np.ndarray, label: str, linestyle: str) -> bool:
+    values = np.asarray(values, dtype=np.float64)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return False
+    x = np.sort(values)
+    y = np.arange(1, x.size + 1, dtype=np.float64) / x.size
+    ax.plot(x, y, linestyle=linestyle, linewidth=2, label=label)
+    return True
+
+
+def save_cee_cdf_analysis(
+    s_gen: np.ndarray,
+    labels: np.ndarray,
+    node_ids: List[str],
+    cee_scores: np.ndarray,
+    y_pred: List[int],
+    output_dir: str,
+    tag: str,
+    config: TrainingConfig,
+) -> Dict:
+    """Save the paper-style CEE score CDF figure and its group metadata."""
+    top_k = int(getattr(config, "cee_cdf_top_k", 100))
+
+    s_gen = np.asarray(s_gen, dtype=np.float64)
+    labels = np.asarray(labels, dtype=np.int32)
+    cee_scores = np.asarray(cee_scores, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.int32)
+
+    if not (len(s_gen) == len(labels) == len(node_ids) == len(cee_scores) == len(y_pred)):
+        raise ValueError("CEE CDF inputs must have the same length")
+
+    finite_idx = np.where(np.isfinite(s_gen) & np.isfinite(cee_scores))[0]
+
+    # Group A: all ground-truth CIB accounts in the test set.
+    positive_idx = finite_idx[labels[finite_idx] == 1]
+    group_a_idx = positive_idx
+
+    # Group B/C are selected by the w/o-L_CEE main model's CIB-branch score.
+    # Exclude known CIB accounts from B/C so the discovery groups do not overlap Group A.
+    rank_pool_idx = finite_idx[labels[finite_idx] != 1]
+    desc_idx = rank_pool_idx[np.argsort(-s_gen[rank_pool_idx])]
+    asc_idx = rank_pool_idx[np.argsort(s_gen[rank_pool_idx])]
+
+    topk_idx = desc_idx[: min(top_k, desc_idx.size)]
+    group_b_idx = topk_idx
+    group_c_idx = asc_idx[: min(top_k, asc_idx.size)]
+
+    groups = {
+        "A_known_cib": group_a_idx,
+        "B_topK_non_known_cib_by_score": group_b_idx,
+        "C_bottomK_predicted_authentic": group_c_idx,
+    }
+
+    group_values = {name: cee_scores[idx] for name, idx in groups.items()}
+    group_records = {
+        name: _records_from_indices(idx, node_ids, labels, s_gen, cee_scores, y_pred)
+        for name, idx in groups.items()
+    }
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    plotted = [
+        _plot_cdf(ax, group_values["A_known_cib"], "Group A", "-"),
+        _plot_cdf(ax, group_values["B_topK_non_known_cib_by_score"], "Group B", "--"),
+        _plot_cdf(ax, group_values["C_bottomK_predicted_authentic"], "Group C", ":"),
+    ]
+    if not any(plotted):
+        plt.close(fig)
+        raise ValueError("No finite CEE scores available for CDF plotting")
+
+    score_mode = str(getattr(config, "cee_score_mode", "log_likelihood")).lower()
+    if score_mode in {"log_likelihood", "logp", "log_likelihood_score"}:
+        xlabel = "CEE score = log p(x_{t+1}|x_t)"
+        title_score = "CEE Log-Likelihood Scores"
+        score_definition = "log p(x_{t+1}|x_t) = - Gaussian autoregressive NLL"
+        score_orientation = "higher means easier to predict under the frozen dynamics model"
+    else:
+        xlabel = "CEE raw NLL = -log p(x_{t+1}|x_t)"
+        title_score = "CEE Raw NLL Scores"
+        score_definition = "Gaussian autoregressive negative log-likelihood"
+        score_orientation = "lower means easier to predict under the frozen dynamics model"
+
+    ax.set_xlabel(xlabel, fontsize=12)
+    ax.set_ylabel("CDF: P(score <= x)", fontsize=12)
+    ax.set_title(f"Weibo-Henan: CDF of {title_score} ({tag})", fontsize=13)
+    ax.legend(loc="upper left", fontsize=10, frameon=True)
+    ax.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+
+    cdf_path = os.path.join(output_dir, f"{tag}_cee_cdf_groups_K{top_k}.png")
+    fig.savefig(cdf_path, dpi=200)
+    plt.close(fig)
+
+    group_json_path = os.path.join(output_dir, f"{tag}_cee_groups_K{top_k}.json")
+    payload = {
+        "K": top_k,
+        "split": "test",
+        "main_model_for_grouping": "w/o L_CEE, selected by validation F1/theta metadata",
+        "cee_score_source": "frozen unsupervised pretrained CEEDynamicsHead",
+        "cee_score_mode": score_mode,
+        "cee_score_definition": score_definition,
+        "score_orientation": score_orientation,
+        "group_definitions": {
+            "A_known_cib": "all test accounts with ground-truth label=1",
+            "B_topK_non_known_cib_by_score": "top-K test accounts by CIB-branch score after excluding Group A",
+            "C_bottomK_predicted_authentic": "bottom-K test accounts by CIB-branch score after excluding Group A",
+        },
+        "group_a_source_positive_count": int(positive_idx.size),
+        "rank_pool_size_excluding_group_a": int(rank_pool_idx.size),
+        "topK_node_ids": [str(node_ids[idx]) for idx in topk_idx.tolist()],
+        "cdf_path": cdf_path,
+        "cee_head_path": os.path.abspath(getattr(config, "cee_head_path", "")),
+        "cee_head_sha256": file_sha256(os.path.abspath(getattr(config, "cee_head_path", ""))),
+        "groups": {
+            name: {
+                "stats": _cee_stats(group_values[name]),
+                "records": group_records[name],
+            }
+            for name in groups
+        },
+        "statistical_tests": {
+            "A_vs_B": _mann_whitney_payload(
+                group_values["A_known_cib"],
+                group_values["B_topK_non_known_cib_by_score"],
+            ),
+            "B_vs_A": _mann_whitney_payload(
+                group_values["B_topK_non_known_cib_by_score"],
+                group_values["A_known_cib"],
+            ),
+            "B_vs_C": _mann_whitney_payload(
+                group_values["B_topK_non_known_cib_by_score"],
+                group_values["C_bottomK_predicted_authentic"],
+            ),
+            "A_vs_C": _mann_whitney_payload(
+                group_values["A_known_cib"],
+                group_values["C_bottomK_predicted_authentic"],
+            ),
+        },
+    }
+    with open(group_json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    return {
+        "cdf_path": cdf_path,
+        "group_json_path": group_json_path,
+        "K": top_k,
+        "group_counts": {
+            name: int(idx.size)
+            for name, idx in groups.items()
+        },
+        "statistical_tests": payload["statistical_tests"],
+    }
 
 
 # ============================================================
@@ -441,6 +657,17 @@ def main():
         s_gen_all, y_all, node_ids_all, cee_all = compute_scores_for_loader(model, test_loader, config)
         metrics = apply_dual_threshold(s_gen_all, y_all, theta)
         recall_at_k = compute_recall_at_k_with_counts(s_gen_all, y_all, k_list=[10, 30, 50])
+        cee_summary = summarize_cee_groups(cee_all, y_all, config)
+        cee_cdf_analysis = save_cee_cdf_analysis(
+            s_gen=s_gen_all,
+            labels=y_all,
+            node_ids=node_ids_all,
+            cee_scores=cee_all,
+            y_pred=metrics["y_pred"],
+            output_dir=inference_output_dir,
+            tag=tag,
+            config=config,
+        )
 
         result = {
             "outer_experiment_tag": tag,
@@ -457,6 +684,8 @@ def main():
                 },
                 "recall_at_k": recall_at_k,
             },
+            "cee_summary": cee_summary,
+            "cee_cdf_analysis": cee_cdf_analysis,
         }
         per_model_results.append(result)
 
@@ -475,6 +704,9 @@ def main():
             "recall_at_k": recall_at_k,
             "node_ids": node_ids_all,
             "s_gen": s_gen_all.tolist(),
+            "cee_scores": cee_all.tolist(),
+            "cee_summary": cee_summary,
+            "cee_cdf_analysis": cee_cdf_analysis,
             "y_true": y_all.tolist(),
             "y_pred": metrics["y_pred"],
         }
@@ -487,6 +719,8 @@ def main():
         print("  Confusion Matrix:")
         print(f"    [[TN={metrics['tn']}, FP={metrics['fp']}],")
         print(f"     [FN={metrics['fn']}, TP={metrics['tp']}]]")
+        print(f"  CEE CDF 图已保存到: {cee_cdf_analysis['cdf_path']}")
+        print(f"  CEE ABC 分组/检验已保存到: {cee_cdf_analysis['group_json_path']}")
         print(f"  推理结果已保存到: {out_json}")
 
         del model

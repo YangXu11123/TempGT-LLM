@@ -1,0 +1,19 @@
+TempGT-LLM 主要超参数
+======================
+- structure_dim: 256
+- text_dim: 384
+- llm_input_dim: 3584
+- lora_rank: 8
+- lora_alpha: 32
+- lora_dropout: 0.1
+- learning_rate: 2e-5
+- lambda_gen: 0.7
+- lambda_align: 0.25
+- lambda_cee: 0.05
+- temperature: 0.07
+- cee_pretrain_epochs: 20
+- cee_pretrain_lr: 1e-3
+- cee_hidden_dim: 512
+- cee_margin: 0.3
+- cls_margin: 0.3
+

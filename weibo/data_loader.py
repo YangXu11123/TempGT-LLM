@@ -1,7 +1,7 @@
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Sampler
 import numpy as np
-from typing import Dict, List
+from typing import Dict, Iterator, List, Optional
 
 
 class TemporalGraphTextDataset(Dataset):
@@ -94,6 +94,7 @@ class TemporalGraphTextDataset(Dataset):
         label = self.labels[node_id]
 
         temporal_node_embeddings = data.get("temporal_node_embeddings", {})
+        temporal_node_embeddings_aug = data.get("temporal_node_embeddings_aug", None)
         temporal_text_embeddings = data.get("temporal_text_embeddings", {})
         timesteps = data.get("timesteps", [])
 
@@ -134,6 +135,8 @@ class TemporalGraphTextDataset(Dataset):
 
         struct_in_list: List[torch.Tensor] = []
         struct_out_list: List[torch.Tensor] = []
+        struct_in_aug_list: List[torch.Tensor] = []
+        struct_out_aug_list: List[torch.Tensor] = []
         text_list: List[torch.Tensor] = []
 
         for t in selected_ts:
@@ -145,9 +148,19 @@ class TemporalGraphTextDataset(Dataset):
             in_emb = self._to_tensor(in_emb, self.struct_node_dim)
             out_emb = self._to_tensor(out_emb, self.struct_node_dim)
 
-            
             struct_in_list.append(in_emb)
             struct_out_list.append(out_emb)
+
+            if isinstance(temporal_node_embeddings_aug, dict):
+                aug_node_dict = temporal_node_embeddings_aug.get(int(t), {})
+                in_aug = self._to_tensor(aug_node_dict.get("in_node_embeddings", None), self.struct_node_dim)
+                out_aug = self._to_tensor(aug_node_dict.get("out_node_embeddings", None), self.struct_node_dim)
+            else:
+                in_aug = torch.empty(0, self.struct_node_dim, dtype=torch.float32)
+                out_aug = torch.empty(0, self.struct_node_dim, dtype=torch.float32)
+
+            struct_in_aug_list.append(in_aug)
+            struct_out_aug_list.append(out_aug)
 
             txt_emb = temporal_text_embeddings.get(int(t), None)
             txt_emb = self._to_tensor(txt_emb, self.text_dim)
@@ -157,6 +170,9 @@ class TemporalGraphTextDataset(Dataset):
             "node_id": node_id,
             "struct_in_list": struct_in_list,   
             "struct_out_list": struct_out_list, 
+            "struct_in_aug_list": struct_in_aug_list,
+            "struct_out_aug_list": struct_out_aug_list,
+            "has_edge_drop_aug": isinstance(temporal_node_embeddings_aug, dict),
             "text_list": text_list,            
             "timesteps": torch.tensor(selected_ts, dtype=torch.long), 
             "label": torch.tensor(label, dtype=torch.long),
@@ -209,11 +225,16 @@ def collate_fn(batch):
     # 节点数的最大值（对 in/out/text 分别统计）
     max_N_in = 0
     max_N_out = 0
+    max_N_in_aug = 0
+    max_N_out_aug = 0
     max_N_txt = 0
+    has_any_edge_aug = any(bool(item.get("has_edge_drop_aug", False)) for item in batch)
 
     for item in batch:
         struct_in_list = item["struct_in_list"]
         struct_out_list = item["struct_out_list"]
+        struct_in_aug_list = item.get("struct_in_aug_list", [])
+        struct_out_aug_list = item.get("struct_out_aug_list", [])
         text_list = item["text_list"]
 
         for emb in struct_in_list:
@@ -222,6 +243,12 @@ def collate_fn(batch):
         for emb in struct_out_list:
             if emb is not None:
                 max_N_out = max(max_N_out, emb.shape[0])
+        for emb in struct_in_aug_list:
+            if emb is not None:
+                max_N_in_aug = max(max_N_in_aug, emb.shape[0])
+        for emb in struct_out_aug_list:
+            if emb is not None:
+                max_N_out_aug = max(max_N_out_aug, emb.shape[0])
         for emb in text_list:
             if emb is not None:
                 max_N_txt = max(max_N_txt, emb.shape[0])
@@ -231,6 +258,10 @@ def collate_fn(batch):
         max_N_in = 1
     if max_N_out == 0:
         max_N_out = 1
+    if max_N_in_aug == 0:
+        max_N_in_aug = 1
+    if max_N_out_aug == 0:
+        max_N_out_aug = 1
     if max_N_txt == 0:
         max_N_txt = 1
 
@@ -241,6 +272,12 @@ def collate_fn(batch):
     struct_out_embeddings = torch.zeros(
         batch_size, T_max, max_N_out, struct_node_dim, dtype=torch.float32
     )
+    struct_in_embeddings_aug = torch.zeros(
+        batch_size, T_max, max_N_in_aug, struct_node_dim, dtype=torch.float32
+    )
+    struct_out_embeddings_aug = torch.zeros(
+        batch_size, T_max, max_N_out_aug, struct_node_dim, dtype=torch.float32
+    )
     text_node_embeddings = torch.zeros(
         batch_size, T_max, max_N_txt, text_dim, dtype=torch.float32
     )
@@ -250,6 +287,12 @@ def collate_fn(batch):
     )
     struct_out_mask = torch.zeros(
         batch_size, T_max, max_N_out, dtype=torch.bool
+    )
+    struct_in_mask_aug = torch.zeros(
+        batch_size, T_max, max_N_in_aug, dtype=torch.bool
+    )
+    struct_out_mask_aug = torch.zeros(
+        batch_size, T_max, max_N_out_aug, dtype=torch.bool
     )
     text_mask = torch.zeros(
         batch_size, T_max, max_N_txt, dtype=torch.bool
@@ -269,15 +312,21 @@ def collate_fn(batch):
 
         struct_in_list = item["struct_in_list"]
         struct_out_list = item["struct_out_list"]
+        struct_in_aug_list = item.get("struct_in_aug_list", [])
+        struct_out_aug_list = item.get("struct_out_aug_list", [])
         text_list = item["text_list"]
 
         for t_idx in range(L_use):
             in_emb = struct_in_list[t_idx]   
             out_emb = struct_out_list[t_idx] 
+            in_aug = struct_in_aug_list[t_idx] if t_idx < len(struct_in_aug_list) else torch.empty(0, struct_node_dim)
+            out_aug = struct_out_aug_list[t_idx] if t_idx < len(struct_out_aug_list) else torch.empty(0, struct_node_dim)
             txt_emb = text_list[t_idx]       
 
             n_in = in_emb.shape[0]
             n_out = out_emb.shape[0]
+            n_in_aug = in_aug.shape[0]
+            n_out_aug = out_aug.shape[0]
             n_txt = txt_emb.shape[0]
 
             if n_in > 0:
@@ -287,6 +336,14 @@ def collate_fn(batch):
             if n_out > 0:
                 struct_out_embeddings[i, t_idx, :n_out, :] = out_emb
                 struct_out_mask[i, t_idx, :n_out] = True
+
+            if n_in_aug > 0:
+                struct_in_embeddings_aug[i, t_idx, :n_in_aug, :] = in_aug
+                struct_in_mask_aug[i, t_idx, :n_in_aug] = True
+
+            if n_out_aug > 0:
+                struct_out_embeddings_aug[i, t_idx, :n_out_aug, :] = out_aug
+                struct_out_mask_aug[i, t_idx, :n_out_aug] = True
 
             if n_txt > 0:
                 text_node_embeddings[i, t_idx, :n_txt, :] = txt_emb
@@ -299,7 +356,7 @@ def collate_fn(batch):
         seq_lens[i] = L_use
         node_ids.append(item["node_id"])
 
-    return {
+    result = {
         "struct_in_embeddings": struct_in_embeddings,   
         "struct_out_embeddings": struct_out_embeddings,  
         "text_node_embeddings": text_node_embeddings,  
@@ -312,6 +369,50 @@ def collate_fn(batch):
         "node_ids": node_ids,
         "seq_lens": seq_lens,                   
     }
+
+    if has_any_edge_aug:
+        result.update({
+            "struct_in_embeddings_aug": struct_in_embeddings_aug,
+            "struct_out_embeddings_aug": struct_out_embeddings_aug,
+            "struct_in_mask_aug": struct_in_mask_aug,
+            "struct_out_mask_aug": struct_out_mask_aug,
+        })
+
+    return result
+
+
+class BalancedPairBatchSampler(Sampler[List[int]]):
+    """Yield batches containing both CIB and normal users for pairwise losses."""
+
+    def __init__(self, labels: List[int], batch_size: int, seed: int = 42):
+        if batch_size < 2:
+            raise ValueError("pairwise_train_batches=True requires batch_size >= 2")
+        self.labels = [int(x) for x in labels]
+        self.batch_size = int(batch_size)
+        self.seed = int(seed)
+        self.pos_indices = [i for i, y in enumerate(self.labels) if y == 1]
+        self.neg_indices = [i for i, y in enumerate(self.labels) if y == 0]
+        self.epoch = 0
+        if not self.pos_indices or not self.neg_indices:
+            raise ValueError("Pairwise batch sampler requires at least one positive and one negative sample")
+
+    def __iter__(self) -> Iterator[List[int]]:
+        rng = np.random.RandomState(self.seed + self.epoch)
+        self.epoch += 1
+        pos = rng.permutation(self.pos_indices).tolist()
+        neg = rng.permutation(self.neg_indices).tolist()
+        n_pos = max(1, self.batch_size // 2)
+        n_neg = max(1, self.batch_size - n_pos)
+        num_batches = min(len(pos) // n_pos, len(neg) // n_neg)
+        for b in range(num_batches):
+            batch = pos[b * n_pos:(b + 1) * n_pos] + neg[b * n_neg:(b + 1) * n_neg]
+            rng.shuffle(batch)
+            yield batch
+
+    def __len__(self) -> int:
+        n_pos = max(1, self.batch_size // 2)
+        n_neg = max(1, self.batch_size - n_pos)
+        return min(len(self.pos_indices) // n_pos, len(self.neg_indices) // n_neg)
 
 
 def create_data_loaders(
@@ -344,14 +445,29 @@ def create_data_loaders(
         text_dim=text_dim,
     )
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=True,
-        collate_fn=collate_fn,
-        num_workers=2,
-        pin_memory=True,
-    )
+    train_labels = [labels[nid] for nid in train_dataset.valid_node_ids]
+    if getattr(config, "pairwise_train_batches", False):
+        train_sampler: Optional[BalancedPairBatchSampler] = BalancedPairBatchSampler(
+            train_labels,
+            batch_size=config.batch_size,
+            seed=int(getattr(config, "current_run_seed", getattr(config, "split_seed", 42))),
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=train_sampler,
+            collate_fn=collate_fn,
+            num_workers=2,
+            pin_memory=True,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            collate_fn=collate_fn,
+            num_workers=2,
+            pin_memory=True,
+        )
 
     val_loader = DataLoader(
         val_dataset,
